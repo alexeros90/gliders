@@ -1,0 +1,7 @@
+pyproject.toml
+src/gliders/__init__.py
+src/gliders/strings.py
+src/gliders.egg-info/PKG-INFO
+src/gliders.egg-info/SOURCES.txt
+src/gliders.egg-info/dependency_links.txt
+src/gliders.egg-info/top_level.txt
