@@ -1,16 +1,274 @@
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import asyncio
 import cv2
 from collections import Counter
 from scipy.ndimage import label, generate_binary_structure, binary_dilation, binary_erosion
 from scipy.ndimage import convolve as sci_convolve
+from skimage.draw import polygon
 from astropy.convolution import convolve, Gaussian2DKernel
 from scipy.interpolate import LinearNDInterpolator
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 
 
-# ------------------------------------------------
+def smooth_region_edge(image, region_mask, bordering_mask = None, layers = 5, background = 0, background_std = 0,
+                       pix_scale = 1, linear_weights = False):
+    if bordering_mask is None:
+        bordering_mask = ~region_mask
+    contact_region = grow_mask(region_mask, 1) & bordering_mask
+    current_layer = contact_region.copy()
+    previous_layer = region_mask.copy()
+    if linear_weights:
+        weights = np.linspace(1, 0, layers)
+    else:
+        weights = np.geomspace(1, 0.05, layers)
+    for layer_index in range(layers):
+        layer_indices = np.argwhere(current_layer)
+        for i, j in layer_indices:
+            i0, i1 = max(i - 1, 0), min(i + 2, image.shape[0])
+            j0, j1 = max(j - 1, 0), min(j + 2, image.shape[1])
+            previous_layer_mask = previous_layer[i0:i1, j0:j1]
+            neighborhood = image[i0:i1, j0:j1]
+            neighbor_vals = neighborhood[previous_layer_mask]
+            neighbor_mean = np.mean(neighbor_vals)
+            image[i, j] = image[i, j] * weights[layer_index] + neighbor_mean * (1 - weights[layer_index])
+        previous_layer = current_layer | previous_layer
+        current_layer = grow_mask(current_layer, 1)
+
+    image = add_noise_to_region(image, previous_layer & ~region_mask, noise_center=background,
+                                noise_std=background_std, scale=pix_scale)
+
+    return image
+
+def get_aspect_ratio(mask):
+    from skimage.measure import regionprops
+    props = regionprops(mask.astype(int))[0]
+    length = props.major_axis_length
+    width = props.minor_axis_length
+    return width/length
+
+def check_edge_contact(mask):
+    edges = np.concatenate([
+        mask[0, :],
+        mask[-1, :],
+        mask[1:-1, 0],
+        mask[1:-1, -1]
+    ])
+    return np.any(edges)
+
+def get_main_source_label(seg_map, source_pos=(0, 0), table = []):
+    main_label = seg_map.data[source_pos[1],source_pos[0]]
+    if main_label > 0:
+        return main_label
+    else:
+        closest_dist = np.sqrt(pow(seg_map.shape[0], 2) + pow(seg_map.shape[1], 2))
+        for src in table:
+            this_dist = np.sqrt(pow(source_pos[0] - src['xcentroid'], 2) + pow(source_pos[1] - src['ycentroid'], 2))
+            if this_dist < closest_dist:
+                main_label = src['label']
+                closest_dist = this_dist
+        return main_label
+
+def contour_contact_endpoints(contour, label_image, target_value, connectivity=4, return_indices=False):
+    """
+    Given a traced contour (list of (row, col)), find the first and last points
+    along the contour that touch a pixel with `target_value`.
+
+    Parameters
+    ----------
+    contour : list of (row, col)
+        Ordered contour coordinates.
+    label_image : 2D np.ndarray
+    target_value : int
+    connectivity : int (4 or 8)
+    return_indices : bool
+        If True, also return indices of these points in contour.
+
+    Returns
+    -------
+    (first_point, last_point) or (first_point, last_point, first_idx, last_idx)
+    """
+    if connectivity == 4:
+        neighbor_offsets = [(-1,0),(1,0),(0,-1),(0,1)]
+    elif connectivity == 8:
+        neighbor_offsets = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
+    else:
+        raise ValueError("connectivity must be 4 or 8")
+
+    contact_indices = []
+    contact_positions = []
+    for idx, (r, c) in enumerate(contour):
+        for dr, dc in neighbor_offsets:
+            nr, nc = r+dr, c+dc
+            if 0 <= nr < label_image.shape[0] and 0 <= nc < label_image.shape[1]:
+                if label_image[nr, nc] == target_value and (r,c) not in contact_positions:
+                    contact_indices.append(idx)
+                    contact_positions.append((r,c))
+                    break  # no need to check more neighbors
+
+    if not contact_indices:
+        return None if not return_indices else (None, None, None, None)
+
+    first_idx = contact_indices[0]
+    last_idx = contact_indices[-1]
+    first_point = contour[first_idx]
+    last_point = contour[last_idx]
+
+    if return_indices:
+        return first_point, last_point, first_idx, last_idx
+    else:
+        return first_point, last_point
+
+def sort_contour_coordinates(mask, connectivity=4):
+    """
+    Trace the contour of a binary mask in order (Moore-Neighbor tracing).
+    Returns a list of (row, col) coordinates in walking order.
+    Works with narrow 1-pixel-wide structures and avoids early termination.
+    """
+    if connectivity == 4:
+        # Right-hand rule (clockwise search)
+        directions = [(-1,0), (0,1), (1,0), (0,-1)]
+    elif connectivity == 8:
+        directions = [(-1,0), (-1,1), (0,1), (1,1),
+                      (1,0), (1,-1), (0,-1), (-1,-1)]
+    else:
+        raise ValueError("connectivity must be 4 or 8")
+
+
+    # Find starting boundary pixel: topmost, then leftmost
+    rows, cols = np.where(mask)
+    if len(rows) == 0:
+        return []
+    start = (rows.min(), cols[rows.argmin()])
+
+    # Start facing "west" (so that we search clockwise around the shape)
+    current = start
+    dir_idx = 0  # index into directions
+    contour = [current]
+    first_time = True
+
+    while True:
+        # Turn left until you find a neighbor inside the mask
+        for i in range(len(directions)):
+            check_idx = (dir_idx + i) % len(directions)
+            dr, dc = directions[check_idx]
+            nr, nc = current[0] + dr, current[1] + dc
+            if 0 <= nr < mask.shape[0] and 0 <= nc < mask.shape[1]:
+                if mask[nr, nc]:
+                    # Found next boundary pixel
+                    current = (nr, nc)
+                    contour.append(current)
+                    dir_idx = (check_idx - 1) % len(directions)  # Turn left relative to movement
+                    break
+
+        if current == start and not first_time:
+            break
+        first_time = False
+
+    return contour
+
+def shift_contour_to_starting_point(contour_pixels, starting_point):
+    # Shift the list to start from the starting_point
+    try:
+        start_idx = contour_pixels.index(starting_point)
+    except ValueError:
+        raise ValueError("Starting point not found in contour pixels.")
+
+    shifted = contour_pixels[start_idx:] + contour_pixels[:start_idx]
+
+    # Remove consecutive duplicates
+    cleaned = [shifted[0]]
+    cleaned.extend(p for i, p in enumerate(shifted[1:], start=1) if p != shifted[i - 1])
+
+    # Ensure the contour is closed
+    if cleaned[0] != cleaned[-1]:
+        cleaned.append(cleaned[0])
+
+    return cleaned
+
+def estimate_overlapping_portion(segmap, main_label, target_label):
+    main_region_mask = segmap == main_label
+    contour_pixels = sort_contour_coordinates(main_region_mask)
+    starting_point = get_starting_point(contour_pixels, segmap, target_label)
+    contour_pixels = shift_contour_to_starting_point(contour_pixels, starting_point)
+    endpoints = contour_contact_endpoints(contour_pixels,segmap,target_label, 4, return_indices=True)
+    if isinstance(endpoints[2], type(None)) or isinstance(endpoints[3], type(None)):
+        return 0
+    overlapping_pixels = count_target_in_closed_segment(contour_pixels, segmap, target_label, endpoints[2], endpoints[3])
+    target_pixels = np.sum(segmap == target_label)
+    # print(overlapping_pixels)
+    # print(target_pixels)
+    return overlapping_pixels/target_pixels
+
+def get_starting_point(contour_pixels, labels, target_value, connectivity=8):
+    if connectivity == 4:
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    elif connectivity == 8:
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                      (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    else:
+        raise ValueError("Connectivity must be 4 or 8.")
+
+    rows, cols = labels.shape
+
+    for pix in contour_pixels:
+        if all(
+            not (0 <= pix[0] + dr[0] < rows and 0 <= pix[1] + dr[1] < cols) or
+            labels[pix[0] + dr[0], pix[1] + dr[1]] != target_value
+            for dr in directions
+        ):
+            return pix
+
+    return contour_pixels[0]  # fallback if no good candidate found
+
+def count_target_in_closed_segment(contour, label_image, target_value, first_idx, last_idx):
+    """
+    Count pixels with value == target_value that are enclosed by:
+    - contour[first_idx:last_idx+1]
+    - straight line from contour[last_idx] to contour[first_idx]
+
+    Parameters
+    ----------
+    contour : list of (row, col)
+    label_image : 2D numpy array
+    target_value : int
+    first_idx, last_idx : int
+        Indices in contour that mark the endpoints.
+
+    Returns
+    -------
+    count : int
+        Number of enclosed pixels with target_value.
+    """
+
+    # extract contour segment
+    if first_idx <= last_idx:
+        segment = contour[first_idx:last_idx + 1]
+    else:
+        # wrap around contour list
+        segment = contour[first_idx:] + contour[:last_idx + 1]
+
+    # add straight line between last -> first
+    r0, c0 = segment[-1]
+    r1, c1 = segment[0]
+    # Bresenham-style integer line
+    line_rr, line_cc = np.linspace(r0, r1, num=max(abs(r1 - r0), abs(c1 - c0)) + 1, dtype=int), \
+        np.linspace(c0, c1, num=max(abs(r1 - r0), abs(c1 - c0)) + 1, dtype=int)
+    line_coords = list(zip(line_rr, line_cc))
+
+    closed_coords = segment + line_coords
+
+    # polygon fill
+    poly_r = [p[0] for p in closed_coords]
+    poly_c = [p[1] for p in closed_coords]
+    rr, cc = polygon(poly_r, poly_c, shape=label_image.shape)
+
+    # count pixels with target value inside polygon
+    mask = (label_image[rr, cc] == target_value)
+    return int(np.sum(mask))
+
 def get_box_bounds(wcs, ref_image_shape):
     nx, ny = ref_image_shape
     corners = np.array([[0, 0], [0, ny], [nx, 0], [nx, ny]])
@@ -29,16 +287,6 @@ def convolve_with_psf(image_data, kernel_std=2.0):
     psf = kernel.array  # we only need the numpy array
     convolved_image = convolve(image_data, psf)
     return convolved_image
-
-def list_rounding(input_list, decimals=3):
-    output_list = []
-    for i_item in input_list:
-        if isinstance(i_item, float):
-            o_item = round(i_item, decimals)
-        else:
-            o_item = i_item
-        output_list.append(o_item)
-    return output_list
 
 def grow_mask(input_mask: np.ndarray, pixels: int) -> np.ndarray:
     """
@@ -85,40 +333,6 @@ def shrink_mask(input_mask: np.ndarray, pixels: int) -> np.ndarray:
     shrunk_mask = binary_erosion(input_mask, structure=structure)
     return shrunk_mask
 
-def GetAxesDims(NoOfPlots, StartHorizontal = True, bias = 0):
-    BaseAxes = [1,1]
-    Enough = False
-    if StartHorizontal:
-        Dim1, Dim2 = 1,0
-        h_bias = bias
-        v_bias = 0
-    else:
-        Dim1, Dim2 = 0,1
-        v_bias = bias
-        h_bias = 0
-    while not Enough:
-        if (BaseAxes[Dim1] * BaseAxes[Dim2]) >= NoOfPlots:
-            Enough = True
-        else:
-            if BaseAxes[Dim1] - h_bias > BaseAxes[Dim2] - v_bias:
-                BaseAxes[Dim2] += 1
-            else:
-                BaseAxes[Dim1] += 1
-    return BaseAxes
-
-def GetNextAxis(Current_Axis = [0,0], shape = [1,1], StartHorizontal = True):
-    if StartHorizontal:
-        if Current_Axis[1] >= shape[1] - 1:
-            Next_Axis = [Current_Axis[0] + 1, 0]
-        else:
-            Next_Axis = [Current_Axis[0], Current_Axis[1]+1]
-    else:
-        if Current_Axis[0] >= shape[0] - 1:
-            Next_Axis = [0, Current_Axis[1] + 1]
-        else:
-            Next_Axis = [Current_Axis[0] + 1, Current_Axis[1]]
-    return Next_Axis
-
 def normalize_data(data, robust = False):
     # Input must be a numpy array
     if robust:
@@ -132,15 +346,6 @@ def normalize_data(data, robust = False):
         data_max = data_min + 1e-6
     data = (data - data_min) / (data_max - data_min)
     return np.clip(data, 0, 1)
-
-def ScientificNotationFormat(number=2.5465168e-20, decimals = 2):
-    new_number = str(number)
-    if "e" in new_number:
-        new_number = str(f'{number:.{decimals}e}')
-        new_number = new_number.split("e")[0] + " \\times 10^{" + new_number.split("e")[1] + "}"
-    else:
-        new_number = str(f'{number:.{decimals}}')
-    return new_number
 
 def get_profile_gradient(profile):
     # This function assumes the x values increase by 1.
@@ -163,7 +368,6 @@ def add_noise_to_region(image, mask, noise_sample = None, noise_center = None, n
 
     image[mask] = image[mask] + noise_img[mask] - noise_center
     return image
-
 
 def rescale_image(image, scale=1.0):
     """
@@ -216,22 +420,40 @@ def rescale_image(image, scale=1.0):
     new_image -= (np.mean(new_image) - original_mean)
     return new_image
 
-
-def center_crop_around_centroid(data, centroid):
+def smooth_blend(noise, image, mask, blend_width=10):
+    from scipy.ndimage import distance_transform_edt
     """
-    Crop the image centered around the centroid, ensuring the shape stays even and valid.
+    Blend image into noise smoothly inside mask.
+
+    Parameters
+    ----------
+    noise : np.ndarray
+        Background array.
+    image : np.ndarray
+        Foreground array of same shape as noise.
+    mask : np.ndarray (bool)
+        Region of interest.
+    blend_width : int
+        Width (in pixels) of the transition zone.
     """
-    cx, cy = map(int, centroid)
-    h, w = data.shape
+    # Distance inside mask (to nearest edge)
+    dist_in = distance_transform_edt(mask)
+    # Distance outside mask (to nearest edge)
+    dist_out = distance_transform_edt(~mask)
 
-    y_extent = min(cy, h - cy)
-    x_extent = min(cx, w - cx)
+    # Weight of image:
+    #  - 1 deep inside mask
+    #  - 0 outside mask
+    #  - smooth transition in between
+    w = np.clip((blend_width - dist_out) / blend_width, 0, 1)
 
-    return data[cy - y_extent:cy + y_extent, cx - x_extent:cx + x_extent]
+    # Blend
+    blended = w * image + (1 - w) * noise
+    return blended
 
 def replace_mask_with_noise(input_image, mask, noise_factor=3, base_line_factor = 0, use_median=False,
-                             smoothing_factor = 0.2,linear_image=True,
-                             n_pixels=3, edge_smoothing_factor=0.5, noise_sample = None, scale = 1):
+                             smoothing_factor = 0.2, linear_image=True,
+                             n_pixels=3, edge_smoothing_factor=0, noise_sample = None, scale = 1):
     """
         Replace pixels inside a mask with noise and optionally smooth them with neighbor pixels.
 
@@ -275,7 +497,7 @@ def replace_mask_with_noise(input_image, mask, noise_factor=3, base_line_factor 
     n_pixels = max(n_pixels, 0)
 
     image = input_image.copy()
-    if isinstance(noise_sample, type(None)):
+    if noise_sample is None:
 
         image_chk = image[~np.isnan(image)]
         background, background_std = sigma_clipping(image, use_median = use_median, iteration_limit=100)
@@ -343,43 +565,42 @@ def replace_mask_with_noise(input_image, mask, noise_factor=3, base_line_factor 
         # Correcting mean for artificial increase due to averaging
         image[mask] -= (np.mean(image[mask]) - pre_smoothing_mask_mean)
 
-    current_mask = mask.copy()
-    prev_layer_mask = ~mask  # First outer reference is outside the mask
-    prev_layer_values = image.copy()
 
-    for layer_index in range(n_pixels):
-        eroded = binary_erosion(current_mask)
-        layer_mask = current_mask ^ eroded  # Pixels in current layer only
-
-        layer_indices = np.argwhere(layer_mask)
-        for i, j in layer_indices:
-            i0, i1 = max(i - 1, 0), min(i + 2, image.shape[0])
-            j0, j1 = max(j - 1, 0), min(j + 2, image.shape[1])
-
-            neighborhood = prev_layer_values[i0:i1, j0:j1]
-            neighbor_mask = prev_layer_mask[i0:i1, j0:j1]
-            neighbor_vals = neighborhood[neighbor_mask]
-
-            if neighbor_vals.size > 0:
-                influence = np.mean(neighbor_vals)
-                image[i, j] = (
-                        (1 - edge_smoothing_factor) * image[i, j] +
-                        edge_smoothing_factor * influence
-                )
-
-        # Update for next layer inward
-        current_mask = eroded
-        prev_layer_mask = layer_mask.copy()
+    if edge_smoothing_factor > 0:
+        current_mask = mask.copy()
+        prev_layer_mask = ~mask  # First outer reference is outside the mask
         prev_layer_values = image.copy()
+        for layer_index in range(n_pixels):
+            eroded = binary_erosion(current_mask)
+            layer_mask = current_mask ^ eroded  # Pixels in current layer only
+            layer_indices = np.argwhere(layer_mask)
+            for i, j in layer_indices:
+                i0, i1 = max(i - 1, 0), min(i + 2, image.shape[0])
+                j0, j1 = max(j - 1, 0), min(j + 2, image.shape[1])
+                neighborhood = prev_layer_values[i0:i1, j0:j1]
+                prev_layer_neighbor_mask = prev_layer_mask[i0:i1, j0:j1]
+                neighbor_vals = neighborhood[prev_layer_neighbor_mask]
+                if neighbor_vals.size > 0:
+                    influence = np.mean(neighbor_vals)
+                    image[i, j] = (
+                            (1 - edge_smoothing_factor) * image[i, j] +
+                            edge_smoothing_factor * influence
+                    )
 
-        if not np.any(current_mask):
-            break  # No more layers inside the mask
+            # Update for next layer inward
+            current_mask = eroded
+            prev_layer_mask = layer_mask.copy()
+            prev_layer_values = image.copy()
+
+            if not np.any(current_mask):
+                break  # No more layers inside the mask
 
     return image
 
-def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.01,
-                   iteration_limit=50, use_median=False, robust=True):
+def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration_limit=50, use_median=False,
+                   robust=True):
     # Will return mean and standard deviation or median and iqr depending on use_median
+    # If convergence_tolerance, the clipping will go on until there is no change in the central measurement or the iteration_limit is exceeded
 
     iter_count = 0
     mask = np.ones(image.shape, dtype=bool)
@@ -392,7 +613,7 @@ def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.01,
         sigma = q75 - q25
     else:
         central_measure = np.mean(masked_image)
-        sigma = np.std(masked_image, ddof=0)  # Use ddof=0 for full population std
+        sigma = np.std(masked_image, ddof=0)
 
     # Initial threshold
     threshold = central_measure + sigma_factor * sigma
@@ -434,107 +655,6 @@ def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.01,
 
     return central_measure, sigma
 
-def sigma_clipping_asymmetryc(image, sigma_factor=3, convergence_tolerance=0.01, iteration_limit=50, robust=True):
-    # Will return mean and standard deviation or median and iqr depending on use_median
-    iter_count = 0
-    mask = np.ones(image.shape, dtype=bool)
-
-    # Initial stats
-    masked_image = image[mask]
-    central_measure = np.median(masked_image)
-    q25, q75 = np.percentile(masked_image, [25, 75])
-    sigma = (q25, q75)
-    upper_limit_distance = q75 - central_measure
-
-    # Initial threshold
-    threshold = central_measure + sigma_factor * upper_limit_distance
-    new_mask = image < threshold
-
-    # quit()
-    while iter_count < iteration_limit:
-        masked_image = image[new_mask]
-        if robust:
-            q_lo, q_hi = np.percentile(masked_image, [5, 95])
-            robust_mask = (masked_image >= q_lo) & (masked_image <= q_hi)
-            trimmed = masked_image[robust_mask]
-        else:
-            trimmed = masked_image
-
-        new_central = np.median(trimmed)
-        q25, q75 = np.percentile(trimmed, [25, 75])
-        sigma = (q25, q75)
-        upper_limit_distance = q75 - central_measure
-
-        # Check convergence
-        if np.abs(new_central - central_measure) < (np.abs(central_measure) * convergence_tolerance):
-            break
-
-        if new_mask.sum() == mask.sum():
-            break
-
-        central_measure = new_central
-        mask = new_mask
-        threshold = central_measure + sigma_factor * upper_limit_distance
-        new_mask = image < threshold
-        iter_count += 1
-
-    return central_measure, sigma
-
-def pad_with_slack(data, slack_factor=2, fill_value=0):
-    h, w = data.shape
-    if isinstance(data[0, 0], float):
-        fill_value = float(fill_value)
-    new_h, new_w = h * slack_factor, w * slack_factor
-    padded = np.full((new_h, new_w), fill_value)
-    y_start = (new_h - h) // 2
-    x_start = (new_w - w) // 2
-    y_end = y_start + h
-    x_end = x_start + w
-    padded[y_start:y_end, x_start:x_end] = data
-    return padded
-
-def check_contact(segmap, label_1, label_2, connectivity=8):
-    from scipy.ndimage import binary_dilation
-    """
-    Check if two labeled segments are touching in a segmentation map.
-
-    Parameters
-    ----------
-    segmap : 2D array-like (int)
-        Segmentation map with integer labels.
-    label_1 : int
-        Label of the main segment.
-    label_2 : int
-        Label of the secondary segment to test.
-    connectivity : {4, 8}, optional
-        Pixel connectivity. If 8, consider diagonal touching as contact.
-
-    Returns
-    -------
-    bool
-        True if label_2 touches label_1; otherwise False.
-    """
-    # Get boolean masks
-    mask_1 = segmap == label_1
-    mask_2 = segmap == label_2
-
-    if not np.any(mask_1) or not np.any(mask_2):
-        return False  # one or both segments not present
-
-    # Define the structure element for dilation
-    if connectivity == 8:
-        structure = np.ones((3, 3), dtype=bool)
-    elif connectivity == 4:
-        structure = np.array([[0,1,0],[1,1,1],[0,1,0]], dtype=bool)
-    else:
-        raise ValueError("connectivity must be 4 or 8")
-
-    # Dilate main region slightly and check for overlap
-    dilated_main = binary_dilation(mask_1, structure=structure)
-    contact = np.any(dilated_main & mask_2)
-
-    return bool(contact)
-
 def get_image_centroid(image):
     x_coords = np.linspace(0, image.shape[1] - 1, image.shape[1]).astype('int')
     y_coords = np.linspace(0, image.shape[0] - 1, image.shape[0]).astype('int')
@@ -544,63 +664,9 @@ def get_image_centroid(image):
     y_mean_sum = np.sum(y_mean)
     if x_mean_sum <= 0 or y_mean_sum <= 0:
         return None
-    x_centroid = int(np.sum(x_mean * x_coords) / np.sum(x_mean))
-    y_centroid = int(np.sum(y_mean * y_coords) / np.sum(y_mean))
+    x_centroid = int(np.sum(x_mean * x_coords) / x_mean_sum)
+    y_centroid = int(np.sum(y_mean * y_coords) / y_mean_sum)
     return (x_centroid, y_centroid)
-
-def area_under_the_curve(x, y, limits = (0,1)):
-    """
-    Compute the area under the curve y = f(x) for a portion of the x domain
-    specified by normalized limits in [0, 1].
-
-    Parameters:
-    - x: 1D numpy array of x values (must be sorted in ascending order)
-    - y: 1D numpy array of y values corresponding to x
-    - limits: tuple (low, high) with values between 0 and 1, indicating
-              the fractional range of the x domain to integrate over
-
-    Returns:
-    - area: float, area under the curve between the specified limits
-    """
-
-    if not (0 <= limits[0] < limits[1] <= 1):
-        raise ValueError("Limits must be a tuple (low, high) with 0 <= low < high <= 1")
-
-    x = np.asarray(x)
-    y = np.asarray(y)
-
-    # Normalize bounds
-    x_min, x_max = x[0], x[-1]
-    x_low = x_min + limits[0] * (x_max - x_min)
-    x_high = x_min + limits[1] * (x_max - x_min)
-
-    # Combine original x and y with interpolated endpoints if needed
-    x_new = []
-    y_new = []
-
-    for bound in [x_low, x_high]:
-        if bound in x:
-            x_new.append(bound)
-            y_new.append(y[np.where(x == bound)[0][0]])
-        else:
-            # Linear interpolation between the two points that surround the bound
-            idx = np.searchsorted(x, bound)
-            if idx == 0 or idx == len(x):
-                raise ValueError("Integration bounds out of x range.")
-            x1, x2 = x[idx - 1], x[idx]
-            y1, y2 = y[idx - 1], y[idx]
-            y_interp = y1 + (y2 - y1) * (bound - x1) / (x2 - x1)
-            x_new.append(bound)
-            y_new.append(y_interp)
-
-    # Create full x and y arrays in the integration region
-    mask = (x > x_low) & (x < x_high)
-    x_region = np.concatenate(([x_low], x[mask], [x_high]))
-    y_region = np.concatenate(([y_new[0]], y[mask], [y_new[1]]))
-
-    # Integrate
-    area = np.trapezoid(y_region, x_region)
-    return area
 
 def grow_pixel_circular(mask_shape, center, radius):
     """
@@ -652,17 +718,20 @@ def adjust_image_resolution_to_scale(image, scale = 1):
     # Correcting mean for artificial increase due to averaging
     image -= (np.mean(image) - pre_smoothing_image_mean)
     return image
-# ------------------------------------------------
 
-
-def has_false_neighbor(mask: np.ndarray, region_mask: np.ndarray) -> bool:
+def has_false_neighbor(mask: np.ndarray, region_mask: np.ndarray, connect_type = 4) -> bool:
     """
     Returns True if any cell in region_mask has a False neighbor in mask.
     """
     # Create a structuring element to define 4- or 8-connected neighborhood
-    structure = np.array([[1, 1, 1],
-                          [1, 1, 1],
-                          [1, 1, 1]])  # 8-connected. Use [[0,1,0],[1,1,1],[0,1,0]] for 4-connected.
+    if connect_type == 8:
+        structure = np.array([[1, 1, 1],
+                              [1, 1, 1],
+                              [1, 1, 1]])
+    else:
+        structure = np.array([[0, 1, 0],
+                              [1, 1, 1],
+                              [0, 1, 0]])
 
     # Dilate the region to get the region + its neighbors
     dilated = binary_dilation(region_mask, structure=structure)
@@ -761,76 +830,103 @@ def coords_to_pixels(sources, wcs):
     sources = sources[(sources['x_pos'] >= 0) & (sources['y_pos'] >= 0)]
     return (sources)
 
+async def _get_nearby_z_sources_async(image_bounds, timeout=60):
+    from gliders.z_queries.DESI_Query import get_desi_sources
+    from gliders.z_queries.SDSS_Query import get_sdss_square_region
+    from gliders.z_queries.NED_Query import get_ned_square_region
+    from gliders.z_queries.GAMA_Query import get_gama_sources
 
-def _run_async_fallback(coro):
-    import threading
-
-    result_container = {}
-
-    def runner():
-        result_container["result"] = asyncio.run(coro)
-
-    t = threading.Thread(target=runner)
-    t.start()
-    t.join()
-
-    return result_container["result"]
-
-async def _get_nearby_z_sources_async(image_bounds, timeout):
-    from DESI_Query import get_desi_sources
-    from SDSS_Query import get_sdss_square_region
-    from NED_Query import get_ned_square_region
-    from GAMA_Query import get_gama_sources
-
-    loop = asyncio.get_running_loop()
-
-    tasks = {
-        "DESI": loop.run_in_executor(None, get_desi_sources,image_bounds[0], image_bounds[1], timeout),
-        "GAMA": loop.run_in_executor(None, get_gama_sources,image_bounds[0], image_bounds[1], timeout),
-        "SDSS": loop.run_in_executor(None, get_sdss_square_region,image_bounds[0], image_bounds[1], 19, timeout),
-        "NED": loop.run_in_executor(None, get_ned_square_region,image_bounds[0], image_bounds[1],True, timeout),
+    tasks = {"DESI": asyncio.to_thread(get_desi_sources, image_bounds[0], image_bounds[1], timeout),
+             "GAMA": asyncio.to_thread(get_gama_sources, image_bounds[0], image_bounds[1], timeout),
+             "SDSS": asyncio.to_thread(get_sdss_square_region, image_bounds[0], image_bounds[1], 19, timeout),
+             "NED": asyncio.to_thread(get_ned_square_region, image_bounds[0], image_bounds[1], True, timeout),
     }
 
-    results = {}
-    completed = await asyncio.gather(*tasks.values(),return_exceptions=True)
+    completed = await asyncio.gather(
+        *tasks.values(),
+        return_exceptions=True
+    )
 
+    results = {}
     for name, result in zip(tasks.keys(), completed):
         if isinstance(result, Exception):
-            print(f"Function {name} failed: {result}")
+            print(f"{name} failed: {result}")
             results[name] = None
         else:
             results[name] = result
 
-    return results
+    return _combine_query_results(results)
 
-def get_nearby_z_sources(image_bounds, timeout=60):
+
+def _get_nearby_z_sources_sync(image_bounds, timeout=60, max_attempts=2, wait_seconds=2):
+    from gliders.z_queries.DESI_Query import get_desi_sources
+    from gliders.z_queries.SDSS_Query import get_sdss_square_region
+    from gliders.z_queries.NED_Query import get_ned_square_region
+    from gliders.z_queries.GAMA_Query import get_gama_sources
+
+    results = {}
+
+    query_functions = {
+        "DESI": lambda: get_desi_sources(image_bounds[0], image_bounds[1], timeout),
+        "GAMA": lambda: get_gama_sources(image_bounds[0], image_bounds[1], timeout),
+        "SDSS": lambda: get_sdss_square_region(image_bounds[0], image_bounds[1], 19, timeout),
+        "NED":  lambda: get_ned_square_region(image_bounds[0], image_bounds[1], True, timeout),
+    }
+
+    for name, func in query_functions.items():
+        try:
+            results[name] = func()
+        except Exception as e:
+            print(f"{name} failed: {e}")
+            results[name] = None
+
+    return _combine_query_results(results)
+
+def _combine_query_results(results_dict):
     """
-    Synchronous wrapper that runs async queries safely.
+    Combine the dictionary of query results into a cleaned dataframe.
     """
-    try:
-        results = asyncio.run(_get_nearby_z_sources_async(image_bounds, timeout))
-    except RuntimeError:
-        # In case an event loop already exists (very rare here, but safe)
-        results = _run_async_fallback(_get_nearby_z_sources_async(image_bounds, timeout))
 
-    all_dfs = []
-    for key, df in results.items():
-        if df is not None and not df.empty:
-            all_dfs.append(df[["object_id", "ra", "dec", "z"]])
+    valid_dfs = [
+        df[["object_id", "ra", "dec", "z"]]
+        for df in results_dict.values()
+        if df is not None and not df.empty
+    ]
 
-    if all_dfs:
-        all_z_sources = pd.concat(all_dfs, ignore_index=True)
+    if valid_dfs:
+        all_z_sources = pd.concat(valid_dfs, ignore_index=True)
     else:
-        all_z_sources = pd.DataFrame(columns=["object_id", "ra", "dec", "z"])
+        all_z_sources = pd.DataFrame(
+            columns=["object_id", "ra", "dec", "z"]
+        )
 
     all_z_sources = all_z_sources.dropna(subset=["z"])
     all_z_sources["object_id"] = all_z_sources["object_id"].astype(str)
+
     return all_z_sources
+
+def get_nearby_z_sources(image_bounds, timeout=60, synchronous=False):
+
+    if synchronous:
+        return _get_nearby_z_sources_sync(image_bounds, timeout)
+    else:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop → safe in scripts
+            return asyncio.run(
+                _get_nearby_z_sources_async(image_bounds, timeout)
+            )
+        else:
+            raise RuntimeError(
+                "Active event loop detected. Use:\n\n"
+                "    await get_nearby_z_sources_async(...)"
+            )
 
 def contour_interpolation(region_mask, image, connectivity=8, add_noise=True, noise_sample=None, decay_threshold=0.1,
                           influence_radius=5):
     # Will get the parameters to then perform an outside-in layer averaging based interpolation with layered_contour_averaging()
-    if add_noise and isinstance(noise_sample, type(None)):
+    if add_noise and noise_sample is None:
         background, background_std = sigma_clipping(image, iteration_limit=50, use_median=False)
         noise_sample = np.random.normal(loc=0, scale=background_std, size=np.sum(region_mask))
     elif not add_noise:
@@ -856,9 +952,12 @@ def layered_contour_averaging(region_mask, image, neighbor_weight=0.5, max_layer
     else:  # 8-connectivity
         neighbor_offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if
                             not (dy == 0 and dx == 0)]
+    if noise_sample is not None:
+        noise_mean = np.mean(noise_sample)
+    else:
+        noise_mean = 0
 
     layer_count = 0
-
     while np.any(current_mask):
         if max_layers is not None and layer_count >= max_layers:
             break
@@ -879,10 +978,9 @@ def layered_contour_averaging(region_mask, image, neighbor_weight=0.5, max_layer
                     noise_pix = np.random.choice(noise_sample)
                 else:
                     noise_pix = 0
-                averaged_image[y, x] = (
-                                               (1 - neighbor_weight) * averaged_image[y, x] +
-                                               neighbor_weight * np.mean(neighbors)
-                                       ) + noise_pix
+                averaged_image[y, x] = ((1 - neighbor_weight) * averaged_image[y, x] +
+                                         neighbor_weight * np.mean(neighbors)
+                                       ) + noise_pix - noise_mean
 
         current_mask = binary_erosion(current_mask)
         previous_contour_mask = contour_mask.copy()

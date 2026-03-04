@@ -5,10 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gliders"
 version = "0.1.0"
-description = "Internal shared utilities"
+description = "GaLaxy Image DEcontamination Scripts - GLIDErS: Galaxy image cleaning and deblending pipeline"
 requires-python = ">=3.9"
 
-dependencies = []
-
+dependencies = [
+    "numpy",
+    "scipy",
+    "astropy",
+    "photutils",
+    "pandas",
+    "scikit-image",
+    "opencv-python",
+    "sep"
+]
 [tool.setuptools.packages.find]
 where = ["src"]

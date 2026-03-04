@@ -1,5 +1,13 @@
 Metadata-Version: 2.4
 Name: gliders
 Version: 0.1.0
-Summary: Internal shared utilities
+Summary: GaLaxy Image DEcontamination Scripts - GLIDErS: Galaxy image cleaning and deblending pipeline
 Requires-Python: >=3.9
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: astropy
+Requires-Dist: photutils
+Requires-Dist: pandas
+Requires-Dist: scikit-image
+Requires-Dist: opencv-python
+Requires-Dist: sep

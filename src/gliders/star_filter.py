@@ -1,8 +1,8 @@
 import numpy as np
-from morph_toolbox import get_image_centroid, sigma_clipping, grow_pixel_circular, get_profile_gradient
 from photutils.profiles import RadialProfile
 from scipy.stats import pearsonr
 from astropy.modeling import models, fitting
+from .utils import get_image_centroid, sigma_clipping, grow_pixel_circular, get_profile_gradient
 
 
 def get_profile_average(profile):
@@ -144,8 +144,10 @@ def process_one_star(this_star, image, params):
     y_cen, x_cen = this_star['ycentroid'], this_star['xcentroid']
     candidate_pos = (int(round(y_cen)), int(round(x_cen)))
     candidate_centroid = candidate_pos
+    # Clip centroid so it is always within the image.
+    candidate_centroid = (np.clip(candidate_centroid[0], 0, image.shape[0] - 1),
+                          np.clip(candidate_centroid[1], 0, image.shape[1] - 1))
     distance_to_closest_edge = get_distance_to_closest_edge(image.shape, candidate_centroid)
-
     relocated = False
     final_radius = 0
     final_profile = None
@@ -158,7 +160,6 @@ def process_one_star(this_star, image, params):
     for radius in range(min_radius, max_radius + 1):
         if radius > half_image_min:
             break
-
         if distance_to_closest_edge < radius / 2 and not relocated:
             mask = grow_pixel_circular(image.shape, candidate_pos, radius)
             new_cc = get_image_centroid(image * image * mask)
@@ -313,7 +314,7 @@ def star_detection_filtering(image, stars_detected, min_radius=2, max_radius=15,
     stars_detected['std'] = 0.0
     half_image_min = np.min(image.shape) / 2
     prof_method = "center"
-    if not isinstance(image_psf,type(None)):
+    if image_psf is not None:
         psf_background, psf_background_std = sigma_clipping(image_psf)
         rp_psf_error = np.zeros_like(image_psf) + psf_background
         rp_psf = RadialProfile(image_psf, (image_psf.shape[1]//2, image_psf.shape[0]//2),

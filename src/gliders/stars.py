@@ -1,14 +1,28 @@
+import numpy as np
 from photutils.detection import DAOStarFinder, IRAFStarFinder
-from star_filter import star_detection_filtering
+from photutils.segmentation import detect_threshold
 from astropy.nddata import Cutout2D
-from utils import interpolate_image, add_noise_to_region, contour_interpolation
+from astropy.table import vstack
 from photutils.aperture import CircularAperture
+import time
+from .star_filter import star_detection_filtering
+from .utils import interpolate_image, add_noise_to_region, contour_interpolation, replace_mask_with_noise, grow_mask, convolve_with_psf, has_false_neighbor, sigma_clipping, estimate_overlapping_portion
 
-def detect_and_mask_stars(image, main_source_mask, main_source_pos, tractor_sources, config,
-                          safe_star_masking_radius, image_psf, pix_scale = 1, show_plots = False):
 
-    # First we detect stars in the image and get their apertures
-    all_star_apertures = find_all_star_apertures(image, main_source_pos, tractor_sources, safe_star_masking_radius, config, use_tractor = True, use_finders = False, clear_nucleus = True, image_psf = image_psf)
+def detect_and_mask_stars(image, main_source_mask, main_source_pos, phot_sources, config, image_psf, pix_scale = 1,
+                          return_image_only = False, show_plots = False):
+    main_source_npixels = np.sum(main_source_mask)
+    if config.auto_safe_masking_region:
+        safe_star_masking_radius = round(np.sqrt(main_source_npixels * config.safe_star_masking_prop_radius / np.pi))
+        if safe_star_masking_radius < 1: safe_star_masking_radius = 1
+    else:
+        safe_star_masking_radius = config.safe_star_masking_radius
+
+    all_star_apertures = find_all_star_apertures(image, main_source_pos, phot_sources, safe_star_masking_radius, config, use_phot_sources = True, use_finders = False, clear_nucleus = True, image_psf = image_psf)
+
+    replaced_mask = np.full_like(image, False, dtype = bool)
+    if all_star_apertures is None:
+        return image, replaced_mask, all_star_apertures
 
     # Separate stars that are overlapping, at the edge and non overlapping with the galaxy
     all_star_apertures_split = classify_apertures(all_star_apertures, main_source_mask)
@@ -17,7 +31,6 @@ def detect_and_mask_stars(image, main_source_mask, main_source_pos, tractor_sour
         plot_apertures(image, all_star_apertures_split)
 
     # Masking the stars that do not overlap with the galaxy
-    replaced_mask = np.full_like(image, False, dtype = bool)
     if len(all_star_apertures_split["outer"]) > 0:
         for ap_key in all_star_apertures_split["outer"]:
             ap_key.r += np.ceil(ap_key.r/2)
@@ -35,22 +48,24 @@ def detect_and_mask_stars(image, main_source_mask, main_source_pos, tractor_sour
         image = interpolate_apertures(image, main_source_mask, all_star_apertures_split["inner"], config.interpolation_extent,
                                       interpolation_region_factor=0.25, is_linear_image=True, pix_scale=pix_scale,
                                       aperture_factor = 2)
+    if return_image_only:
+        return image
+    else:
+        return image, replaced_mask, all_star_apertures_split
 
-    return image, all_star_apertures_split, replaced_mask
-
-def find_all_star_apertures(image, main_source_pos, tractor_sources, safe_star_masking_radius,config, use_tractor = True, use_finders = False, clear_nucleus = True, image_psf = None):
-    if not use_tractor and not use_finders:
-        print("Both tractor and the finders are turned off, so no stars will be detected.")
-        return {}
+def find_all_star_apertures(image, main_source_pos, phot_sources, safe_star_masking_radius,config, use_phot_sources = True, use_finders = False, clear_nucleus = True, image_psf = None):
+    if not use_phot_sources and not use_finders:
+        print("Both the finders and photometric sources are turned off, so no stars will be detected.")
+        return None
 
     all_stars_detected_list = []
 
     times = {}
     times["start"] = time.perf_counter()
-    if not isinstance(tractor_sources,type(None)) and use_tractor:
-        # We use the detections from tractor
-        stars_from_tractor = tractor_sources[tractor_sources['type']=='PSF']
-        all_stars_detected_list.append(stars_from_tractor)
+    if phot_sources is not None and use_phot_sources:
+        # We use the detections from the input use_phot_sources table
+        stars_from_phot_sources = phot_sources[phot_sources['type']=='PSF']
+        all_stars_detected_list.append(stars_from_phot_sources)
 
     if use_finders:
         # We detect stars in the image
@@ -84,7 +99,7 @@ def find_all_star_apertures(image, main_source_pos, tractor_sources, safe_star_m
         t_det = time.perf_counter()
 
     if len(all_stars_detected_list)==0:
-        return {}
+        return None
     times["kernels"] = time.perf_counter()
     all_stars_detected = vstack(all_stars_detected_list, metadata_conflicts = 'silent')
     all_stars_detected['id'] = np.arange(1, len(all_stars_detected) + 1)
@@ -92,7 +107,7 @@ def find_all_star_apertures(image, main_source_pos, tractor_sources, safe_star_m
     times["redu"] = time.perf_counter()
 
     filter_psf_std = config.star_filter_psf_std
-    if not isinstance(image_psf,type(None)):
+    if image_psf is not None:
         psf_for_stars = convolve_with_psf(image_psf, filter_psf_std)
     else:
         psf_for_stars = None
@@ -106,6 +121,9 @@ def find_all_star_apertures(image, main_source_pos, tractor_sources, safe_star_m
                                                   image_psf = psf_for_stars, gaussian_fit_max_sigma = config.star_filter_gaussian_fit_max_sigma,
                                                   do_parallel = False)
 
+    if all_stars_detected is None:
+        return None
+
     times["plus"] = time.perf_counter()
 
     all_star_apertures = get_star_apertures(all_stars_detected)
@@ -117,6 +135,7 @@ def find_all_star_apertures(image, main_source_pos, tractor_sources, safe_star_m
 
     # showit = True
     # if showit:
+    #     import matplotlib.pyplot as plt
     #     plt.imshow(image - np.min(image), norm = 'log')
     #     for ap in all_star_apertures.values():
     #         ap.plot(color = "red", lw = 1)
@@ -134,13 +153,15 @@ def find_all_star_apertures(image, main_source_pos, tractor_sources, safe_star_m
     return all_star_apertures
 
 def classify_apertures(all_star_apertures, main_source_mask):
+    if all_star_apertures is None:
+        return None
     all_star_apertures_split = {"inner":[],"edge":[],"outer":[]}
     for ap_key in all_star_apertures.keys():
         ap_mask = all_star_apertures[ap_key].to_mask(method='exact').to_image(main_source_mask.shape,dtype=bool)
         if np.any(main_source_mask & ap_mask):
             union_mask = main_source_mask | ap_mask
             ap_mask_grown = grow_mask(ap_mask, int(np.ceil(all_star_apertures[ap_key].r/2)))
-            if has_false_neighbor(union_mask, ap_mask_grown):
+            if has_false_neighbor(union_mask, ap_mask_grown, connect_type=4):
                 all_star_apertures_split["edge"].append(all_star_apertures[ap_key])
             else:
                 all_star_apertures_split["inner"].append(all_star_apertures[ap_key])
@@ -150,6 +171,7 @@ def classify_apertures(all_star_apertures, main_source_mask):
     return all_star_apertures_split
 
 def plot_apertures(image, all_star_apertures):
+    import matplotlib.pyplot as plt
     plt.imshow(image + np.abs(np.min(image)),norm = 'log', origin = "lower", cmap = "grey")
     for ap_grp in all_star_apertures.items():
         if ap_grp[0] == "outer":
@@ -209,6 +231,8 @@ def detect_stars_in_image(image, star_detection_threshold, star_detector, star_f
     return stars_detected
 
 def get_star_apertures(stars_detected, default_radius = 2):
+    if stars_detected is None:
+        return stars_detected
     detected_star_apertures={}
     current_id = 1
     if 'r' not in stars_detected.colnames:
@@ -246,6 +270,8 @@ def remove_redundant_star_detections(all_stars_detected, min_separation):
     return all_stars_detected[id_mask]
 
 def remove_nucleus_apertures(apertures, source_pos, safe_radius=1):
+    if apertures is None:
+        return apertures
     to_remove = []
     filtered_apertures = apertures.copy()
     if not isinstance(apertures, type(None)):
@@ -272,7 +298,7 @@ def mask_edge_stars(image,main_source_mask,all_star_apertures, config, pix_scale
         label_map[ed_mask] = lbl_count
         overlapping_portion = estimate_overlapping_portion(label_map, ed_main_lbl, lbl_count)
         # print("overlapping_portion", overlapping_portion)
-        if overlapping_portion < config.overlapping_portion_threshold:
+        if overlapping_portion < config.overlap_portion_threshold:
             image = replace_mask_with_noise(image, ed_mask, n_pixels=round(ed_ap.r / 2), noise_factor=5,
                                             scale=pix_scale,
                                             use_median=False, edge_smoothing_factor=0.4)
@@ -289,11 +315,12 @@ def mask_edge_stars(image,main_source_mask,all_star_apertures, config, pix_scale
                                           noise_sample=layer_noise_sample, decay_threshold=0.1,
                                           influence_radius=influence_radius)
         lbl_count += 1
-    # plt.imshow(label_map, origin="lower")
-    # plt.show()
+
     return image, edge_replaced_mask
 
 def star_contamination_check(main_source_mask, all_star_apertures, safe_pix_ratio, verbose=True):
+    if all_star_apertures is None:
+        return False
     main_source_px = np.sum(main_source_mask)
     for star_group in ["inner", "edge"]:
         for this_ap in all_star_apertures[star_group]:

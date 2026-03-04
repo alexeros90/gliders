@@ -1,3 +1,2 @@
-from .strings import slugify
-
-__all__ = ["slugify"]
+from .pipeline import clean_image
+# __all__ = ["get_clean_image_and_segment"]
