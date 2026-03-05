@@ -133,15 +133,6 @@ def find_all_star_apertures(image, main_source_pos, phot_sources, safe_star_mask
         all_star_apertures = remove_nucleus_apertures(all_star_apertures, main_source_pos, safe_star_masking_radius)
         times["nucs"] = time.perf_counter()
 
-    # showit = True
-    # if showit:
-    #     import matplotlib.pyplot as plt
-    #     plt.imshow(image - np.min(image), norm = 'log')
-    #     for ap in all_star_apertures.values():
-    #         ap.plot(color = "red", lw = 1)
-    #     plt.show()
-
-
     # print()
     # print("TIMES:")
     # print(times['kernels'] - times['start'])
@@ -173,6 +164,7 @@ def classify_apertures(all_star_apertures, main_source_mask):
 def plot_apertures(image, all_star_apertures):
     import matplotlib.pyplot as plt
     plt.imshow(image + np.abs(np.min(image)),norm = 'log', origin = "lower", cmap = "grey")
+    plt.title('Detected stars')
     for ap_grp in all_star_apertures.items():
         if ap_grp[0] == "outer":
             color = "red"
@@ -180,8 +172,15 @@ def plot_apertures(image, all_star_apertures):
             color = "blue"
         else:
             color = "limegreen"
+        ap_lbl = True
         for ap_obj in ap_grp[1]:
-            ap_obj.plot(color=color, lw=1)
+            if ap_lbl:
+                label = ap_grp[0]
+                ap_lbl = False
+            else:
+                label = None
+            ap_obj.plot(color=color, lw=1, label = label)
+    plt.legend()
     plt.show()
 
 def interpolate_apertures(image_data, main_source_mask, apertures, interpolation_extent=3,

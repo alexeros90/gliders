@@ -2,7 +2,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.io import fits
-from gliders import clean_image
+import gliders as gl
 from astropy.wcs import WCS
 def extract_psf_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
     all_psf = {}
@@ -71,12 +71,10 @@ def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
 
     return all_bands, all_weights, ref_hdu
 
-file_dir = "D:\\Astrostuff\\PhD\\Data\\DESI FITS"
+file_dir = "C:\\Astrostuff\\PhD\\Data\\DESI FITS"
 # file_name = "39633321931571417_r.fits"
-# file_name = "11834-12703_gr_psf.fits"
 file_name = "ngc6505_cutout_mer.fits"
 
-bands_to_analyze = ['r','g']
 file_path = os.path.join(file_dir, file_name)
 # with fits.open(file_path) as hdu_list:
 #     hdu_list.info()
@@ -87,56 +85,21 @@ with fits.open(file_path) as hdu_list:
     hdu_list.info()
     image = hdu_list[0].data
 
-def get_aspect_ratio(mask):
-    from skimage.measure import regionprops
-    props = regionprops(mask.astype(int))[0]
-    length = props.major_axis_length
-    width = props.minor_axis_length
-    return width/length
-
-
-print(np.geomspace(1,0.1,10))
-quit()
-# image = hdu_list
-image[:,:] = 0
-image = image.astype(bool)
-image[30:50,30:35] = True
-image[45:50,10:40] = True
-image[30:50,15:20] = True
-rt = get_aspect_ratio(image)
 plt.imshow(image)
 plt.show()
-quit()
-results = clean_image(image, return_clean_image_only=False)
-image = results[0]
-flags = results[3]
-print(flags)
-plt.imshow(image, norm = 'log')
-plt.show()
+results = gl.clean_image(image, return_clean_image_only=False)
 
-quit()
-image = all_psf['r']
-flat = image.copy().flatten()
-# plt.hist(flat, bins = np.linspace(np.min(flat),np.max(flat),20), log = True)
-plt.hist(flat, bins = np.linspace(np.min(flat),0.0003,30), log = True)
-# plt.imshow(image)
-plt.show()
+# results = gl.clean_image(image, image_psf = None, config = None, source_pos = None, redshift = None, phot_sources = None,
+#                 wcs = None, return_clean_image_only = False, clean_artifacts = True, skip_flagged_artifacts = True,
+#                 reduce_noise_level = False, subtract_background = False, mask_sec_objects = True, mask_stars = True,
+#                 deblend_sources = True, deblend_with_redshift = True, deblend_delta_z = None, deblend_with_photo_type = True,
+#                 sync_z_query = False, clear_all_but_segment = False, smooth_segmap = True, pix_scale = 1, verbose = True,
+#                 show_plots = False)
 
-quit()
-from gliders.utils import sigma_clipping
-from astropy.stats import sigma_clip
-from scipy.stats import sigmaclip
-import time
-times = {}
-times[0] = time.perf_counter()
-them_vals = sigma_clipping(image, iteration_limit = 1000, robust = False, convergence_tolerance=0.0001)
-times[1] = time.perf_counter()
-them_vals2 = sigma_clip(image, sigma_upper = 3, sigma_lower=10, maxiters = 100, cenfunc = "mean")
-times[2] = time.perf_counter()
-them_vals3, a, b = sigmaclip(image, high = 3)
-times[3] = time.perf_counter()
-print(them_vals)
-print(np.mean(them_vals2),np.std(them_vals2))
-print(np.mean(them_vals3),np.std(them_vals3))
-# for ks in range(1,len(times)):
-#     print(times[ks]-times[ks-1])
+print(results)
+# image = results[0]
+# flags = results[3]
+# print(flags)
+# plt.imshow(image, norm = 'log', origin = "lower")
+# plt.show()
+

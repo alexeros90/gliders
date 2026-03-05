@@ -109,8 +109,8 @@ def analyze_deblended_map(segmap_deblend, main_label, phot_sources = None, use_r
     discard_label = safe_label + 1
 
     if use_redshift:
-        segmap_deblend = check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift,
-                                                   max_delta_z, wcs = wcs, synch_z_query = synch_z_query,
+        segmap_deblend, z_sources = check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift,
+                                                   max_delta_z, wcs = wcs, synch_z_query = synch_z_query, return_z_sources = True,
                                                    show_plots = False, verbose = verbose)
     else:
         if verbose:
@@ -146,21 +146,13 @@ def analyze_deblended_map(segmap_deblend, main_label, phot_sources = None, use_r
     segmap_deblend = SegmentationImage(segmap_deblend_split)
 
     if show_plots:
-        import matplotlib.pyplot as plt
-        fg, axo = plt.subplots(2, 2)
-        axo[0, 0].imshow(segmap_deblend_initial.data, origin="lower")
-        axo[0, 0].set_title("initial")
-        axo[0, 1].imshow(segmap_deblend_z, origin="lower")
-        axo[0, 1].set_title("deblend z")
-        axo[1, 0].imshow(segmap_deblend_phot, origin="lower")
-        axo[1, 0].set_title("deblend phot")
-        axo[1, 1].imshow(segmap_deblend, origin="lower")
-        axo[1, 1].set_title("final")
-        plt.show()
+        plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z,segmap_deblend_phot, segmap_deblend, redshift,
+                            z_sources, phot_sources)
+
     return segmap_deblend
 
-def check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift, max_delta_z,
-                              wcs = None, synch_z_query = True, show_plots = False, verbose = False):
+def check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift, max_delta_z, wcs = None,
+                              synch_z_query = True, return_z_sources = False, show_plots = False, verbose = False):
     if redshift is None:
         print("The provided redshift is not valid. Redshift-based deblending will be omitted.")
         return segmap_deblend
@@ -225,9 +217,10 @@ def check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_la
     if show_plots:
         axo[1].imshow(segmap_deblend, origin="lower")
         plt.show()
-
-    return segmap_deblend
-
+    if return_z_sources:
+        return segmap_deblend, nearby_sources
+    else:
+        return segmap_deblend
 def check_deblended_photo_sources(segmap_deblend, main_label, safe_label, discard_label, phot_sources,
                                   show_plots = False, verbose = False):
     if show_plots:
@@ -474,3 +467,33 @@ def merge_touching_regions(segm, main_label, seg_label, connectivity=8):
             new_data[sub_mask] = main_label
 
     return SegmentationImage(new_data)
+
+
+def plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z, segmap_deblend_phot, segmap_deblend, redshift = None,
+                        z_sources=None, phot_sources=None):
+    import matplotlib.pyplot as plt
+    sdi_reset = segmap_deblend_initial.copy()
+    sdz_reset = segmap_deblend_z.copy()
+    sdp_reset = segmap_deblend_phot.copy()
+    sd_reset = segmap_deblend.copy()
+    for seg_map in (sdi_reset, sdz_reset, sdp_reset, sd_reset):
+        seg_map.relabel_consecutive()
+    fg, axo = plt.subplots(2, 2, figsize=(6, 7))
+    fg.suptitle('Deblending maps')
+    axo[0, 0].imshow(sdi_reset, origin="lower")
+    axo[0, 0].set_title("initial")
+    axo[0, 1].imshow(sdz_reset, origin="lower")
+    axo[0, 1].set_title("deblend z")
+    if redshift is not None:
+        axo[0, 1].text(round(sdi_reset.data.shape[1]*0.02),round(sdi_reset.data.shape[0]*0.98), f'main z = {redshift:.4f}', color="lime", fontsize=10, ha='left',va='top')
+    if z_sources is not None:
+        for row in z_sources[['x_pos', 'y_pos', 'z']].itertuples(index=False):
+            axo[0, 1].text(int(row.x_pos), int(row.y_pos), f'{row.z:.4f}', color="red", fontsize=7, ha='center', va='center')
+    axo[1, 0].imshow(sdp_reset.data, origin="lower")
+    axo[1, 0].set_title("deblend phot")
+    if phot_sources is not None:
+        for x, y, type in phot_sources['xcentroid', 'ycentroid', 'type'].iterrows():
+            axo[1, 0].text(int(x), int(y), f'{type}', color="red", fontsize=6, ha='center', va='center')
+    axo[1, 1].imshow(sd_reset.data, origin="lower")
+    axo[1, 1].set_title("final")
+    plt.show()

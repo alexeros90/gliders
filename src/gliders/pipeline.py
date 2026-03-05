@@ -86,7 +86,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             if (np.max(image)/img_bkg_lvl) > config.artifact_candidate_ratio:
                 image, artifact_mask, artifact_flag = detect_and_clean_artifacts(image, config, img_bkg_lvl,
                                                                                  pix_scale = pix_scale,
-                                                                                 skip_flagged_artifacts = skip_flagged_artifacts)
+                                                                                 skip_flagged_artifacts = skip_flagged_artifacts, show_plots=show_plots)
                 cleaning_mask = artifact_mask | cleaning_mask
                 phot_sources = update_sources(phot_sources, artifact_mask) # Adding detected artifacts to photo source table
                 # times["artifact_cleaning"] = time.perf_counter()
@@ -104,10 +104,11 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         # First detection of sources
         if verbose:
             print("Detecting sources in the image...")
+
         image_convolved, seg_map, main_source_segment = update_detections(image, config, source_min_pix, source_pos, verbose)
         seg_map_mask = seg_map.make_source_mask()
         if not seg_map_mask[source_pos[1], source_pos[0]]:
-            raise Exception("No sources were detected in the expected location.")
+            raise Exception("No sources were detected in the expected location. Either the source is too faint or source_pos does not coincide with the x,y source position")
 
         source_cat = SourceCatalog(image, seg_map)
         if verbose:
@@ -139,7 +140,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
                                                                               source_pos, config, deblend_with_redshift,
                                                                               redshift, deblend_delta_z, deblend_with_photo_type,
                                                                               phot_sources, config.keep_undecided_segments,
-                                                                              wcs, pix_scale, sync_z_query)
+                                                                              wcs, pix_scale, sync_z_query,show_plots = show_plots)
             cleaning_mask = deblending_mask | cleaning_mask
             # Updating the convolved image and segmentation map of the post-deblend main source
             image_convolved, seg_map, main_source_segment = update_detections(image, config, source_min_pix, source_pos, verbose)

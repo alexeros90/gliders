@@ -1,8 +1,9 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from IPython.core.pylabtools import figsize
 from astropy.io import fits
-from gliders import clean_image
+import gliders as gl
 from astropy.wcs import WCS
 
 def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
@@ -50,11 +51,24 @@ def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
             print(f"Skipped HDU due to error: {e}")
 
     return all_bands, all_weights, ref_hdu
-# file_dir = "D:\\Astrostuff\\PhD\\Data\\DESI FITS"
-file_dir = "C:\\DESI_fits_images\\DESI_dwarf_AGN_fits"
-object_id = "39633419155538773"
-obj_coords = (192.04242,62.67725)
-redshift = 0.0821
+
+file_dir = "C:\\Astrostuff\\PhD\\Data\\DESI FITS"
+# file_dir = "C:\\DESI_fits_images\\DESI_dwarf_AGN_fits"
+# object_id = "39627841612027510"
+# id_n_z = (,)
+object_info = (39633244085289292,173.47971,49.84688, 0.0821)
+# object_info = (39633293687129181,212.82599,52.89456,0.07559)
+# object_info = (39627884997902878,218.32299,3.9033,0.02958)
+# object_info = (39627842752876903,218.68445,2.20796,0.06553)
+
+# object_id = "39627841586861186"
+# object_id = "39627842752876903"
+object_id = object_info[0]
+obj_coords = (object_info[1],object_info[2])
+redshift = object_info[3]
+
+
+
 bands = ['r']
 file_name = f"{object_id}_{bands[0]}.fits"
 sources_name = f"{object_id}_sources.fits"
@@ -66,21 +80,35 @@ with fits.open(file_path) as hdu_list:
     hdu_list.info()
     all_bands, all_weights, ref_header = extract_band_data(hdu_list, verbose=True,
                                                                bands_to_analyze=bands)
+
 from astropy.table import Table
 with fits.open(sources_path) as hdul:
     data = hdul[1].data
     as_table = Table(data)
 wcs = WCS(ref_header)
 tractor_x_pix, tractor_y_pix = wcs.all_world2pix(as_table['ra'], as_table['dec'], 0)  # origin=0 for Python indexing
+source_x_pix, source_y_pix = wcs.all_world2pix(obj_coords[0], obj_coords[1], 0)  # origin=0 for Python indexing
+source_pos = (np.round(source_x_pix), np.round(source_y_pix))
 as_table['xcentroid'] = tractor_x_pix
 as_table['ycentroid'] = tractor_y_pix
-desired_cols = as_table['type','xcentroid','ycentroid']
+phot_sources = as_table['type','xcentroid','ycentroid']
 pix_scale = 1.72
-# plt.imshow(all_bands['r'], norm = "log")
-# plt.show()
-clean_r, seg,removal_mask, cleaning_flags = clean_image(all_bands['r'], redshift=redshift, wcs=wcs, mask_stars = True,
-                                                        show_plots=True, deblend_sources = True, mask_sec_objects = True,
-                                                        clean_artifacts = True, phot_sources = desired_cols,
-                                                        pix_scale = pix_scale)
-plt.imshow(clean_r, norm = "log", origin = "lower")
+raw_image = all_bands['r']
+
+results = gl.clean_image(raw_image, redshift=redshift, wcs=wcs, mask_stars = True, show_plots=True, deblend_sources = True,
+                         mask_sec_objects = True, clean_artifacts = True, phot_sources = phot_sources, source_pos=source_pos,
+                         pix_scale = pix_scale, verbose = True, skip_flagged_artifacts = False)
+
+clean_image, seg_map, removal_mask, cleaning_flags = results
+
+print(cleaning_flags)
+fig, ax = plt.subplots(2,2, figsize = (6,6))
+ax[0,0].imshow(raw_image-np.min(raw_image), norm = "log", origin = "lower", cmap = "gray")
+ax[0,0].set_title("Raw image")
+ax[0,1].imshow(clean_image-np.min(clean_image), norm = "log", origin = "lower", cmap = "gray")
+ax[0,1].set_title("Clean image")
+ax[1,0].imshow(seg_map, origin = "lower")
+ax[1,0].set_title("Segmentation map")
+ax[1,1].imshow(removal_mask, origin = "lower")
+ax[1,1].set_title("Removal mask")
 plt.show()

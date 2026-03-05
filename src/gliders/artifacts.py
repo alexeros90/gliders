@@ -4,12 +4,19 @@ from photutils.segmentation import SourceCatalog, detect_sources
 
 
 def detect_and_clean_artifacts(image, config, img_bkg_lvl, pix_scale=1, skip_flagged_artifacts = False,
-                               return_image_only = False):
+                               return_image_only = False, show_plots = False):
     artifact_mask = detect_artifacts(image, npixels_artifact=config.npixels_artifact,
                                      delta_slope_threshold=config.artifact_delta_slope_threshold,
                                      segment_slack=config.artifact_segment_slack,
                                      hi_pass_threshold=img_bkg_lvl * config.artifact_candidate_ratio)
     artifact_flag = get_artifact_flag(artifact_mask, config)
+    if show_plots:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(1,2)
+        fig.suptitle('Detected artifacts')
+        ax[0].imshow(image, norm = "log", origin = "lower")
+        ax[1].imshow(artifact_mask, origin = "lower")
+        plt.show()
     if (artifact_mask == True).any() and not (skip_flagged_artifacts and artifact_flag):
         growth = round(np.sqrt(np.sum(artifact_mask))*0.15)
         artifact_mask = grow_mask(artifact_mask, pixels=growth)
@@ -22,7 +29,8 @@ def detect_and_clean_artifacts(image, config, img_bkg_lvl, pix_scale=1, skip_fla
         return image, artifact_mask, artifact_flag
 
 
-def detect_artifacts(image, npixels_artifact=100, delta_slope_threshold = 2.7, segment_slack = 5, hi_pass_threshold = 1):
+def detect_artifacts(image, npixels_artifact=100, delta_slope_threshold = 2.7, segment_slack = 5, hi_pass_threshold = 1,
+                     show_plots = False):
     # This function detects artifacts in the image data. If there are artifacts detected within the circle of radius =image_size/4 it will flag the image.
     # If there are no artifacts detected, it will mask the candidates outside the circle and replace them with noise so the image is still usable.
 
