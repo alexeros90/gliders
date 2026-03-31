@@ -4,6 +4,12 @@ from photutils.segmentation import detect_threshold, detect_sources, Segmentatio
 from .utils import convolve_with_psf, normalize_data, replace_mask_with_noise, grow_mask, sigma_clipping, adjust_image_resolution_to_scale, smooth_blend
 
 
+def make_background_robust(image, sigma=5):
+    bkg_lvl, bkg_std = sigma_clipping(image)
+    outlier_mask = image < bkg_lvl - sigma * bkg_std
+    image[outlier_mask] = np.random.normal(loc=bkg_lvl, scale=bkg_std, size=np.sum(outlier_mask))
+    return image
+
 def segmentation_map_smoothing(seg_map):
     smoothed_segmap_mask = convolve_with_psf(seg_map.make_source_mask().astype(int), kernel_std=2)
     smoothed_segmap_mask = np.round(smoothed_segmap_mask, 0)

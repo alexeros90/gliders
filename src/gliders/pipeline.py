@@ -6,7 +6,7 @@ from .noise_pusher import diminish_noise_level
 from .stars import detect_and_mask_stars, star_contamination_check
 from .deblending import deblend_and_mask_sources
 from .artifacts import detect_and_clean_artifacts
-from .others import background_subtraction, mask_secondary_detections, clear_background, segmentation_map_smoothing
+from .others import background_subtraction, mask_secondary_detections, clear_background, segmentation_map_smoothing, make_background_robust
 import traceback
 import time
 
@@ -40,8 +40,8 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
                 wcs = None, return_clean_image_only = False, clean_artifacts = True, skip_flagged_artifacts = True,
                 reduce_noise_level = False, subtract_background = False, mask_sec_objects = True, mask_stars = True,
                 deblend_sources = True, deblend_with_redshift = True, deblend_delta_z = None,
-                deblend_with_photo_type = True, sync_z_query = False, clear_all_but_segment = False, smooth_segmap = True, pix_scale = 1,
-                verbose = True, show_plots = False):
+                deblend_with_photo_type = True, robust_background = True, sync_z_query = False,
+                clear_all_but_segment = False, smooth_segmap = True, pix_scale = 1, verbose = True, show_plots = False):
 
     try:
         # ------------ Handling input parameters ------------
@@ -69,6 +69,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         # Initializing default flags
         artifact_flag = False
         deblended_flag = False
+        deblend_bad_z_query_flag = False
         big_contaminator_flag = False
         offset_flag = False
         small_source_flag = False
@@ -85,7 +86,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             # Non modified images with artifacts generally have pixels with values >> background, so first we filter based on that
             if (np.max(image)/img_bkg_lvl) > config.artifact_candidate_ratio:
                 image, artifact_mask, artifact_flag = detect_and_clean_artifacts(image, config, img_bkg_lvl,
-                                                                                 pix_scale = pix_scale,
+                                                                                 pix_scale = pix_scale, main_source_pos=source_pos,
                                                                                  skip_flagged_artifacts = skip_flagged_artifacts, show_plots=show_plots)
                 cleaning_mask = artifact_mask | cleaning_mask
                 phot_sources = update_sources(phot_sources, artifact_mask) # Adding detected artifacts to photo source table
@@ -136,7 +137,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         if deblend_sources:
             if verbose:
                 print("Deblending sources...")
-            image, deblending_mask, deblended_flag = deblend_and_mask_sources(image, image_convolved, main_source_segment,
+            image, deblending_mask, deblended_flag, deblend_bad_z_query_flag = deblend_and_mask_sources(image, image_convolved, main_source_segment,
                                                                               source_pos, config, deblend_with_redshift,
                                                                               redshift, deblend_delta_z, deblend_with_photo_type,
                                                                               phot_sources, config.keep_undecided_segments,
@@ -167,6 +168,9 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         if clear_all_but_segment:
             image, cleaning_mask = clear_background(image, main_source_mask, pix_scale)
 
+        if robust_background & ~clear_all_but_segment:
+            image = make_background_robust(image)
+
         source_npixels_final = np.sum(main_source_mask)
         if source_npixels_final < source_min_pix:
             small_source_flag = True
@@ -181,7 +185,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
                 print("WARNING: Galaxy might be partially out of the image")
             offset_flag = True
 
-        cleaning_flags = [int(artifact_flag), int(offset_flag), int(deblended_flag), int(big_contaminator_flag), int(small_source_flag)]
+        cleaning_flags = [int(artifact_flag), int(offset_flag), int(deblended_flag), int(deblend_bad_z_query_flag), int(big_contaminator_flag), int(small_source_flag)]
 
         if verbose:
             print("Image cleaning finished!")

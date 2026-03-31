@@ -11,6 +11,7 @@ from astropy.convolution import convolve, Gaussian2DKernel
 from scipy.interpolate import LinearNDInterpolator
 import astropy.units as u
 from astropy.coordinates import SkyCoord
+import time
 
 
 def smooth_region_edge(image, region_mask, bordering_mask = None, layers = 5, background = 0, background_std = 0,
@@ -830,16 +831,28 @@ def coords_to_pixels(sources, wcs):
     sources = sources[(sources['x_pos'] >= 0) & (sources['y_pos'] >= 0)]
     return (sources)
 
-async def _get_nearby_z_sources_async(image_bounds, timeout=60):
+async def _get_nearby_z_sources_async(image_bounds, timeout=60, max_attempts=2, retry_wait=2):
     from gliders.z_queries.DESI_Query import get_desi_sources
     from gliders.z_queries.SDSS_Query import get_sdss_square_region
     from gliders.z_queries.NED_Query import get_ned_square_region
     from gliders.z_queries.GAMA_Query import get_gama_sources
 
-    tasks = {"DESI": asyncio.to_thread(get_desi_sources, image_bounds[0], image_bounds[1], timeout),
-             "GAMA": asyncio.to_thread(get_gama_sources, image_bounds[0], image_bounds[1], timeout),
-             "SDSS": asyncio.to_thread(get_sdss_square_region, image_bounds[0], image_bounds[1], 19, timeout),
-             "NED": asyncio.to_thread(get_ned_square_region, image_bounds[0], image_bounds[1], True, timeout),
+    # tasks = {"DESI": asyncio.to_thread(get_desi_sources, image_bounds[0], image_bounds[1], timeout),
+    #          "GAMA": asyncio.to_thread(get_gama_sources, image_bounds[0], image_bounds[1], timeout),
+    #          "SDSS": asyncio.to_thread(get_sdss_square_region, image_bounds[0], image_bounds[1], 19, timeout),
+    #          "NED": asyncio.to_thread(get_ned_square_region, image_bounds[0], image_bounds[1], True, timeout),
+    # }
+    failed_query = False
+
+    tasks = {
+        "DESI": _retry_async(lambda: asyncio.to_thread(get_desi_sources, image_bounds[0], image_bounds[1], timeout),
+            max_attempts, retry_wait),
+        "GAMA": _retry_async(lambda: asyncio.to_thread(get_gama_sources, image_bounds[0], image_bounds[1], timeout),
+            max_attempts, retry_wait),
+        "SDSS": _retry_async(lambda: asyncio.to_thread(get_sdss_square_region, image_bounds[0], image_bounds[1], 19, timeout),
+            max_attempts, retry_wait),
+        "NED": _retry_async(lambda: asyncio.to_thread(get_ned_square_region, image_bounds[0], image_bounds[1], True, timeout),
+            max_attempts, retry_wait),
     }
 
     completed = await asyncio.gather(
@@ -852,17 +865,42 @@ async def _get_nearby_z_sources_async(image_bounds, timeout=60):
         if isinstance(result, Exception):
             print(f"{name} failed: {result}")
             results[name] = None
+            failed_query = True
         else:
             results[name] = result
 
-    return _combine_query_results(results)
+    return _combine_query_results(results), failed_query
+
+async def _retry_async(func, max_attempts, wait_seconds = 2):
+    last_exception = None
+    for attempt in range(max_attempts):
+        try:
+            return await func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(wait_seconds)
+    return last_exception
 
 
-def _get_nearby_z_sources_sync(image_bounds, timeout=60, max_attempts=2, wait_seconds=2):
+def _retry_sync(func, max_attempts, wait_seconds = 2):
+    last_exception = None
+    for attempt in range(max_attempts):
+        try:
+            return func()
+        except Exception as e:
+            last_exception = e
+            if attempt < max_attempts - 1:
+                time.sleep(wait_seconds)
+    raise last_exception
+
+def _get_nearby_z_sources_sync(image_bounds, timeout=60, max_attempts=2, retry_wait=2):
     from gliders.z_queries.DESI_Query import get_desi_sources
     from gliders.z_queries.SDSS_Query import get_sdss_square_region
     from gliders.z_queries.NED_Query import get_ned_square_region
     from gliders.z_queries.GAMA_Query import get_gama_sources
+
+    failed_query = False
 
     results = {}
 
@@ -875,12 +913,21 @@ def _get_nearby_z_sources_sync(image_bounds, timeout=60, max_attempts=2, wait_se
 
     for name, func in query_functions.items():
         try:
-            results[name] = func()
+            results[name] = _retry_sync(func, max_attempts, retry_wait)
         except Exception as e:
             print(f"{name} failed: {e}")
             results[name] = None
+            failed_query = True
 
-    return _combine_query_results(results)
+
+    # for name, func in query_functions.items():
+    #     try:
+    #         results[name] = func()
+    #     except Exception as e:
+    #         print(f"{name} failed: {e}")
+    #         results[name] = None
+
+    return _combine_query_results(results), failed_query
 
 def _combine_query_results(results_dict):
     """
@@ -905,18 +952,16 @@ def _combine_query_results(results_dict):
 
     return all_z_sources
 
-def get_nearby_z_sources(image_bounds, timeout=60, synchronous=False):
+def get_nearby_z_sources(image_bounds, timeout=60, synchronous=False, attempts = 2):
 
     if synchronous:
-        return _get_nearby_z_sources_sync(image_bounds, timeout)
+        return _get_nearby_z_sources_sync(image_bounds, timeout, max_attempts = 2, retry_wait = 2)
     else:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             # No running loop → safe in scripts
-            return asyncio.run(
-                _get_nearby_z_sources_async(image_bounds, timeout)
-            )
+            return asyncio.run(_get_nearby_z_sources_async(image_bounds, timeout, max_attempts = 2, retry_wait = 2) )
         else:
             raise RuntimeError(
                 "Active event loop detected. Use:\n\n"
