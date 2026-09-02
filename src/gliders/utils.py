@@ -13,6 +13,8 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 import time
 
+from sympy.physics.units import newton
+
 
 def smooth_region_edge(image, region_mask, bordering_mask = None, layers = 5, background = 0, background_std = 0,
                        pix_scale = 1, linear_weights = False):
@@ -348,6 +350,54 @@ def normalize_data(data, robust = False):
     data = (data - data_min) / (data_max - data_min)
     return np.clip(data, 0, 1)
 
+def get_profile(image, center_pos = None, radius = 1):
+    if center_pos is None:
+        center_pos = image.shape[0] // 2, image.shape[1] // 2
+    current_mask = np.zeros_like(image, dtype=bool)
+    current_mask[center_pos] = True
+    profile = []
+    for layer in range(1, radius + 1):
+        new_mask = np.zeros_like(image, dtype=bool)
+        new_mask[center_pos] = True
+        new_mask = grow_mask(new_mask, layer)
+        profile_mask = np.logical_xor(new_mask, current_mask)
+        mean_value = float(np.mean(image[profile_mask]))
+        profile.append(mean_value)
+        current_mask = new_mask
+    return profile
+
+def get_profile_from_border(image, mask=None, n_layers=1):
+    if n_layers < 0:
+        raise ValueError("n_layers must be >= 0")
+
+    if mask is None:
+        mask = np.zeros(image.shape[:2], dtype=bool)
+        center = (image.shape[0] // 2, image.shape[1] // 2)
+        mask[center] = True
+
+    if mask.shape != image.shape[:2]:
+        raise ValueError(
+            f"mask shape {mask.shape} does not match image shape {image.shape[:2]}"
+        )
+
+    max_layers = min(image.shape[:2]) // 2
+    n_layers = min(n_layers, max_layers)
+
+    profile = []
+
+    previous = shrink_mask(mask, 1)
+    profile_mean = float(np.mean(image[mask ^ previous]))
+    profile.append(profile_mean)
+
+    previous = mask
+    for layer_idx in range(1, n_layers + 1):
+        current = grow_mask(mask, layer_idx)
+        profile_mean = float(np.mean(image[current ^ previous]))
+        profile.append(profile_mean)
+        previous = current
+
+    return profile
+
 def get_profile_gradient(profile):
     # This function assumes the x values increase by 1.
     profile = np.asarray(profile)
@@ -656,6 +706,21 @@ def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration
 
     return central_measure, sigma
 
+def linear_kernel(type=8, center_weight=2.0):
+    if type == 8:
+        kernel = np.ones((3, 3))  # includes center
+    elif type == 4:
+        kernel = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+    else:
+        kernel = np.array(
+            [[0.25, 0.5, 0.75, 0.5, 0.25], [0.5, 0.75, 1, 0.75, 0.5], [0.75, 1, 1, 1, 0.75], [0.5, 0.75, 1, 0.75, 0.5],
+             [0.25, 0.5, 0.75, 0.5, 0.25]])
+
+    kernel[kernel.shape[0] // 2, kernel.shape[1] // 2] = center_weight
+    # normalize kernel so sum of neighbor weights = 1 (optional)
+    kernel = kernel / kernel.sum()
+    return kernel
+
 def get_image_centroid(image):
     x_coords = np.linspace(0, image.shape[1] - 1, image.shape[1]).astype('int')
     y_coords = np.linspace(0, image.shape[0] - 1, image.shape[0]).astype('int')
@@ -831,17 +896,20 @@ def coords_to_pixels(sources, wcs):
     sources = sources[(sources['x_pos'] >= 0) & (sources['y_pos'] >= 0)]
     return (sources)
 
+def check_ra_range_leap(ra_range):
+    dir_dif = abs(ra_range[1] - ra_range[0])
+    skip_dif = abs(ra_range[1] + 360 - ra_range[0])
+    if dir_dif > skip_dif and (ra_range[1]<ra_range[0]):
+        return True
+    else:
+        return False
+
 async def _get_nearby_z_sources_async(image_bounds, timeout=60, max_attempts=2, retry_wait=2):
     from gliders.z_queries.DESI_Query import get_desi_sources
     from gliders.z_queries.SDSS_Query import get_sdss_square_region
     from gliders.z_queries.NED_Query import get_ned_square_region
     from gliders.z_queries.GAMA_Query import get_gama_sources
 
-    # tasks = {"DESI": asyncio.to_thread(get_desi_sources, image_bounds[0], image_bounds[1], timeout),
-    #          "GAMA": asyncio.to_thread(get_gama_sources, image_bounds[0], image_bounds[1], timeout),
-    #          "SDSS": asyncio.to_thread(get_sdss_square_region, image_bounds[0], image_bounds[1], 19, timeout),
-    #          "NED": asyncio.to_thread(get_ned_square_region, image_bounds[0], image_bounds[1], True, timeout),
-    # }
     failed_query = False
 
     tasks = {
@@ -871,7 +939,7 @@ async def _get_nearby_z_sources_async(image_bounds, timeout=60, max_attempts=2, 
 
     return _combine_query_results(results), failed_query
 
-async def _retry_async(func, max_attempts, wait_seconds = 2):
+async def _retry_async_OLD(func, max_attempts, wait_seconds = 2):
     last_exception = None
     for attempt in range(max_attempts):
         try:
@@ -882,6 +950,17 @@ async def _retry_async(func, max_attempts, wait_seconds = 2):
                 await asyncio.sleep(wait_seconds)
     return last_exception
 
+
+#TEST MEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+async def _retry_async(func, max_attempts, wait_seconds=2):
+    for attempt in range(max_attempts):
+        try:
+            return await func()
+        except Exception:
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(wait_seconds)
+            else:
+                raise
 
 def _retry_sync(func, max_attempts, wait_seconds = 2):
     last_exception = None
@@ -919,14 +998,6 @@ def _get_nearby_z_sources_sync(image_bounds, timeout=60, max_attempts=2, retry_w
             results[name] = None
             failed_query = True
 
-
-    # for name, func in query_functions.items():
-    #     try:
-    #         results[name] = func()
-    #     except Exception as e:
-    #         print(f"{name} failed: {e}")
-    #         results[name] = None
-
     return _combine_query_results(results), failed_query
 
 def _combine_query_results(results_dict):
@@ -955,13 +1026,13 @@ def _combine_query_results(results_dict):
 def get_nearby_z_sources(image_bounds, timeout=60, synchronous=False, attempts = 2):
 
     if synchronous:
-        return _get_nearby_z_sources_sync(image_bounds, timeout, max_attempts = 2, retry_wait = 2)
+        return _get_nearby_z_sources_sync(image_bounds, timeout, max_attempts = attempts, retry_wait = 2)
     else:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             # No running loop → safe in scripts
-            return asyncio.run(_get_nearby_z_sources_async(image_bounds, timeout, max_attempts = 2, retry_wait = 2) )
+            return asyncio.run(_get_nearby_z_sources_async(image_bounds, timeout, max_attempts = attempts, retry_wait = 2) )
         else:
             raise RuntimeError(
                 "Active event loop detected. Use:\n\n"

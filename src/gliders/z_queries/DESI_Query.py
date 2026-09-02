@@ -1,14 +1,20 @@
 from dl import queryClient as qc, authClient as ac
+from ..utils import check_ra_range_leap
 
-def get_desi_sources(ra_range, dec_range, timeout = 60):
+def get_desi_sources(ra_range, dec_range, timeout = 60, max_sources = 15):
     # print(ac.whoAmI())
+    if check_ra_range_leap(ra_range):
+        ra_line = f"AND (zp.mean_fiber_ra BETWEEN {ra_range[0]} AND 360 OR zp.mean_fiber_ra BETWEEN 0 AND {ra_range[1]}) "
+    else:
+        ra_line = f"AND zp.mean_fiber_ra BETWEEN {ra_range[0]} AND {ra_range[1]} "
+
     sql = f"""
-            SELECT TOP 15 zp.targetid, zp.mean_fiber_ra, zp.mean_fiber_dec,
+            SELECT TOP {max_sources} zp.targetid, zp.mean_fiber_ra, zp.mean_fiber_dec,
                    zp.z, zp.spectype
             FROM desi_dr1.zpix AS zp
             WHERE (zp.survey='main') AND zp.main_primary
             AND zp.zwarn = 0 
-            AND zp.mean_fiber_ra BETWEEN {ra_range[0]} AND {ra_range[1]}
+            {ra_line}
             AND zp.mean_fiber_dec BETWEEN {dec_range[0]} AND {dec_range[1]}
             """
     qc.set_timeout_request(timeout)

@@ -39,10 +39,9 @@ def update_detections(image, config, source_min_pix, source_pos, verbose):
 def clean_image(image, image_psf = None, config = None, source_pos = None, redshift = None, phot_sources = None,
                 wcs = None, return_clean_image_only = False, clean_artifacts = True, skip_flagged_artifacts = True,
                 reduce_noise_level = False, subtract_background = False, mask_sec_objects = True, mask_stars = True,
-                deblend_sources = True, deblend_with_redshift = True, deblend_delta_z = None,
+                deblend_sources = True, deblend_with_redshift = True, deblend_delta_z = None, keep_undecided_segments = True,
                 deblend_with_photo_type = True, robust_background = True, sync_z_query = False,
                 clear_all_but_segment = False, smooth_segmap = True, pix_scale = 1, verbose = True, show_plots = False):
-
     try:
         # ------------ Handling input parameters ------------
         if not np.any(image.astype(bool)):
@@ -67,11 +66,11 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         source_min_pix = config.source_min_pix
 
         # Initializing default flags
-        artifact_flag = False
+        unsafe_artifact_flag = False
+        big_contaminator_flag = False
+        offset_source_flag = False
         deblended_flag = False
         deblend_bad_z_query_flag = False
-        big_contaminator_flag = False
-        offset_flag = False
         small_source_flag = False
         # ---------------------------------------------------
 
@@ -85,7 +84,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
                 print("Detecting and cleaning overexposure artifacts...")
             # Non modified images with artifacts generally have pixels with values >> background, so first we filter based on that
             if (np.max(image)/img_bkg_lvl) > config.artifact_candidate_ratio:
-                image, artifact_mask, artifact_flag = detect_and_clean_artifacts(image, config, img_bkg_lvl,
+                image, artifact_mask, unsafe_artifact_flag = detect_and_clean_artifacts(image, config, img_bkg_lvl,
                                                                                  pix_scale = pix_scale, main_source_pos=source_pos,
                                                                                  skip_flagged_artifacts = skip_flagged_artifacts, show_plots=show_plots)
                 cleaning_mask = artifact_mask | cleaning_mask
@@ -137,11 +136,13 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         if deblend_sources:
             if verbose:
                 print("Deblending sources...")
+            z_timeout = config.z_query_timeout
             image, deblending_mask, deblended_flag, deblend_bad_z_query_flag = deblend_and_mask_sources(image, image_convolved, main_source_segment,
                                                                               source_pos, config, deblend_with_redshift,
                                                                               redshift, deblend_delta_z, deblend_with_photo_type,
-                                                                              phot_sources, config.keep_undecided_segments,
-                                                                              wcs, pix_scale, sync_z_query,show_plots = show_plots)
+                                                                              phot_sources, keep_undecided_segments,
+                                                                              wcs, pix_scale, sync_z_query, z_timeout,
+                                                                              show_plots = show_plots)
             cleaning_mask = deblending_mask | cleaning_mask
             # Updating the convolved image and segmentation map of the post-deblend main source
             image_convolved, seg_map, main_source_segment = update_detections(image, config, source_min_pix, source_pos, verbose)
@@ -183,9 +184,9 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         if offset_source_pos or edge_contact:
             if verbose:
                 print("WARNING: Galaxy might be partially out of the image")
-            offset_flag = True
+            offset_source_flag = True
 
-        cleaning_flags = [int(artifact_flag), int(offset_flag), int(deblended_flag), int(deblend_bad_z_query_flag), int(big_contaminator_flag), int(small_source_flag)]
+        cleaning_flags = [int(unsafe_artifact_flag), int(offset_source_flag), int(deblended_flag), int(deblend_bad_z_query_flag), int(big_contaminator_flag), int(small_source_flag)]
 
         if verbose:
             print("Image cleaning finished!")

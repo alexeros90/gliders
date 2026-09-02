@@ -2,21 +2,30 @@ from astroquery.sdss import SDSS
 from astropy import coordinates as coords
 from astropy.coordinates import SkyCoord
 import astropy.units as u
+from ..utils import check_ra_range_leap
 
 def get_sdss_square_region(RA_range, DEC_range, data_release = 19, timeout = 60):
     point_1 = SkyCoord(ra=RA_range[0]*u.degree, dec=DEC_range[0]*u.degree, frame='icrs')
     point_2 = SkyCoord(ra=RA_range[1]*u.degree, dec=DEC_range[1]*u.degree, frame='icrs')
     radius = point_1.separation(point_2).arcmin/2
     if radius > 3:
+        print("Maximum allowed search radius is 3 arcmin. Truncating to 3 arcmin.")
         radius = 3
         # SDSS does not allow searches greater than 3 arcminutes
     RA_center = (RA_range[0] + RA_range[1]) / 2
     DEC_center = (DEC_range[0] + DEC_range[1]) / 2
     sources = get_sdss_sources(RA_center, DEC_center, radius_arcmin=radius, data_release = data_release, timeout = timeout)
 
+    leap_ra = check_ra_range_leap(RA_range)
+
     if sources is not None:
-        sources = sources[(sources['ra'] >= RA_range[0]) & (sources['ra'] <= RA_range[1]) &
+        if not leap_ra:
+            sources = sources[(sources['ra'] >= RA_range[0]) & (sources['ra'] <= RA_range[1]) &
                           (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
+        else:
+            sources = sources[(((sources['ra'] >= RA_range[0]) & (sources['ra'] <= 360)) |
+                              ((sources['ra'] <= RA_range[1]) & (sources['ra'] >= 0))) &
+                              (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
     return sources
 
 
@@ -45,7 +54,8 @@ def get_sdss_sources(RA_center, DEC_center, radius_arcmin, data_release = 19, ph
                                    spectro=(not photo), data_release=data_release)
     except Exception as e:
         print(f"❌ SDSS Query failed: {e}")
-        return None
+        raise e
+        # return None
 
     if isinstance(result, type(None)):
         return None

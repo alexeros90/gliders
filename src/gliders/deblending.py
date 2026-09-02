@@ -11,7 +11,8 @@ from .utils import (separate_segments, get_nearby_z_sources, coords_to_pixels, g
 def deblend_and_mask_sources(image, image_convolved = None, main_source_segment = None, source_pos = None, config = None,
                              use_redshift = True, ref_redshift = None, max_delta_z = 0.005, use_photo_type = True,
                              phot_sources = None, keep_undecided_segments = True, wcs = None, pix_scale=1,
-                             synch_z_query = True, return_image_only = False, show_plots=False, verbose=False):
+                             synch_z_query = True, z_query_timeout = 60, return_image_only = False, show_plots=False,
+                             verbose=False):
 
     # Determining the minimum number of pixels for de-blending
     deblended_flag = False
@@ -49,7 +50,7 @@ def deblend_and_mask_sources(image, image_convolved = None, main_source_segment 
         deb_main_label = get_main_source_label(segmap_deblend, source_pos=source_pos, table=deb_cat.to_table())
         segmap_deblend, failed_z_query = analyze_deblended_map(segmap_deblend, deb_main_label, phot_sources, use_redshift, ref_redshift,
                                                max_delta_z, use_photo_type, keep_undecided_segments, wcs, synch_z_query,
-                                               show_plots, verbose)
+                                               z_query_timeout, show_plots, verbose)
 
         if len(segmap_deblend.labels) > 1:
             image = remove_deblended_objects(image, segmap_deblend, deb_main_label,
@@ -103,16 +104,17 @@ def get_deblended_map(image, seg_map, deblend_tool = 'sep', npixels = None, cont
 
 def analyze_deblended_map(segmap_deblend, main_label, phot_sources = None, use_redshift = True, redshift = None,
                           max_delta_z = None, use_photo_type = True, keep_undecided_labels = True, wcs = None,
-                          synch_z_query = True, show_plots = False, verbose = False):
+                          synch_z_query = True, z_query_timeout = 60, show_plots = False, verbose = False):
 
     segmap_deblend_initial = segmap_deblend.copy()
     safe_label = int(np.max(segmap_deblend.labels) + 1)
     discard_label = safe_label + 1
     failed_z_query = False
+    z_sources = None
     if use_redshift:
         segmap_deblend, z_sources, failed_z_query = check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift,
                                                    max_delta_z, wcs = wcs, synch_z_query = synch_z_query, return_segmap_only = False,
-                                                   show_plots = False, verbose = verbose)
+                                                   z_query_timeout = z_query_timeout, show_plots = False, verbose = verbose)
     else:
         if verbose:
             print("Deblending by source redshift is not activated.")
@@ -147,13 +149,14 @@ def analyze_deblended_map(segmap_deblend, main_label, phot_sources = None, use_r
     segmap_deblend = SegmentationImage(segmap_deblend_split)
 
     if show_plots:
-        plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z,segmap_deblend_phot, segmap_deblend, redshift,
+        plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z, segmap_deblend_phot, segmap_deblend, redshift,
                             z_sources, phot_sources)
 
     return segmap_deblend, failed_z_query
 
 def check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift, max_delta_z, wcs = None,
-                              synch_z_query = True, return_segmap_only = False, show_plots = False, verbose = False):
+                              synch_z_query = True, return_segmap_only = False, z_query_timeout = 60, show_plots = False,
+                              verbose = False):
     if redshift is None:
         print("The provided redshift is not valid. Redshift-based deblending will be omitted.")
         return segmap_deblend
@@ -174,12 +177,15 @@ def check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_la
     image_h, image_w = segmap_deblend.data.shape
     if verbose:
         print("Looking for nearby sources with available redshift")
-    nearby_sources, failed_z_query = get_nearby_z_sources(image_bounds, synchronous = synch_z_query, attempts = 2)
+    nearby_sources, failed_z_query = get_nearby_z_sources(image_bounds, timeout=z_query_timeout, synchronous = synch_z_query, attempts = 2)
 
     if not len(nearby_sources)>0:
         if verbose:
             print("No nearby redshift sources detected.")
-        return segmap_deblend
+        if return_segmap_only:
+            return segmap_deblend
+        else:
+            return segmap_deblend, nearby_sources, failed_z_query
 
     nearby_sources = coords_to_pixels(nearby_sources, wcs)
     # print(nearby_sources.to_string())
@@ -472,7 +478,7 @@ def merge_touching_regions(segm, main_label, seg_label, connectivity=8):
 
 
 def plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z, segmap_deblend_phot, segmap_deblend, redshift = None,
-                        z_sources=None, phot_sources=None):
+                        z_sources = None, phot_sources = None):
     import matplotlib.pyplot as plt
     sdi_reset = segmap_deblend_initial.copy()
     sdz_reset = segmap_deblend_z.copy()
@@ -488,6 +494,7 @@ def plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z, segmap_deblend
     axo[0, 1].set_title("deblend z")
     if redshift is not None:
         axo[0, 1].text(round(sdi_reset.data.shape[1]*0.02),round(sdi_reset.data.shape[0]*0.98), f'main z = {redshift:.4f}', color="lime", fontsize=10, ha='left',va='top')
+    # print(z_sources)
     if z_sources is not None:
         for row in z_sources[['x_pos', 'y_pos', 'z']].itertuples(index=False):
             axo[0, 1].text(int(row.x_pos), int(row.y_pos), f'{row.z:.4f}', color="red", fontsize=7, ha='center', va='center')
