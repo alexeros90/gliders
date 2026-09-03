@@ -4,7 +4,7 @@ from photutils.segmentation import SourceCatalog, detect_sources
 
 
 def detect_and_clean_artifacts(image, config = None, img_bkg_lvl = None, pix_scale = 1, main_source_pos = None,
-                               skip_flagged_artifacts = False, show_plots = False):
+                               skip_flagged_artifacts = False, verbose = False,  show_plots = False):
     """
     Detect and optionally remove overexposure artifacts from an image.
 
@@ -97,6 +97,12 @@ def detect_and_clean_artifacts(image, config = None, img_bkg_lvl = None, pix_sca
                                      delta_slope_threshold=config.artifact_delta_slope_threshold,
                                      segment_slack=config.artifact_segment_slack,
                                      hi_pass_threshold=img_bkg_lvl * config.artifact_candidate_ratio)
+
+    if artifact_segmap is None:
+        if verbose:
+            print("No overexposure artifacts were detected in the image.")
+        cleaning_mask = np.zeros_like(image, dtype=bool)
+        return image, cleaning_mask, False
 
     artifact_mask = artifact_segmap.make_source_mask()
     unsafe_artifact_flag = get_artifact_flag(artifact_mask, main_source_pos, config.artifact_rel_size_thresh, config.artifact_safe_region_radius, show_plots = show_plots)
@@ -224,8 +230,7 @@ def detect_artifacts(image, npixels_artifact=100, delta_slope_threshold = 2.7, s
     hi_pass_mask = image > hi_pass_threshold
     artifacts_segmap = detect_sources(hi_pass_mask, 0.5, npixels_artifact, connectivity=8)
     if artifacts_segmap is None:
-        candidate_artifacts_mask = np.full(image.shape, False, dtype=bool)
-        return candidate_artifacts_mask
+        return artifacts_segmap
 
     candidate_artifacts_mask = artifacts_segmap.data > 0
 

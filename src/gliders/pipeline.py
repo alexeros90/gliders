@@ -2,7 +2,7 @@ import numpy as np
 from astropy.table import Table, vstack
 from photutils.segmentation import SourceCatalog, detect_threshold, detect_sources
 from .utils import convolve_with_psf, sigma_clipping, get_main_source_label, check_edge_contact
-from .noise_pusher import diminish_noise_level
+from .background_suppressor import suppress_background
 from .stars import detect_and_mask_stars, star_contamination_check
 from .deblending import deblend_and_mask_sources
 from .artifacts import detect_and_clean_artifacts
@@ -19,7 +19,15 @@ def update_sources(sources_table, artifact_mask):
         sources_table = vstack([sources_table, artifact_table])
     return sources_table
 
-def update_detections(image, config, source_min_pix, source_pos, verbose):
+def update_detections(image, config = None, source_min_pix = 1, source_pos = None, verbose = False):
+    if config is None:
+        print("No config provided. Using default config.")
+        from .cleaning_configs import configs
+        config = configs["default"]
+    if source_pos is None:
+        ny, nx = image.shape
+        source_pos = np.array((int(nx / 2), int(ny / 2)))
+
     image_convolved = convolve_with_psf(image, kernel_std=config.psf_std)
     threshold = detect_threshold(image_convolved, nsigma=config.galaxy_detection_threshold)
     seg_map = detect_sources(image_convolved, threshold, source_min_pix, connectivity=config.connect_mode)
@@ -86,13 +94,14 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             if (np.max(image)/img_bkg_lvl) > config.artifact_candidate_ratio:
                 image, artifact_mask, unsafe_artifact_flag = detect_and_clean_artifacts(image, config, img_bkg_lvl,
                                                                                  pix_scale = pix_scale, main_source_pos=source_pos,
-                                                                                 skip_flagged_artifacts = skip_flagged_artifacts, show_plots=show_plots)
+                                                                                 skip_flagged_artifacts = skip_flagged_artifacts,
+                                                                                 verbose = verbose, show_plots=show_plots)
                 cleaning_mask = artifact_mask | cleaning_mask
                 phot_sources = update_sources(phot_sources, artifact_mask) # Adding detected artifacts to photo source table
                 # times["artifact_cleaning"] = time.perf_counter()
 
         if reduce_noise_level:
-            image = diminish_noise_level(image, method = "logit", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
+            image = suppress_background(image, method ="logit", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
             # smooth_noise_curve must be False, otherwise sep deblending may not work correctly
 
         if subtract_background:

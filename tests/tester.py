@@ -53,10 +53,13 @@ def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
     return all_bands, all_weights, ref_hdu
 
 file_dir = "C:\\Astrostuff\\PhD\\Data\\DESI FITS"
-# file_dir = "C:\\DESI_fits_images\\DESI_dwarf_AGN_fits"
+#file_dir = "C:\\Astrostuff\\PhD\\Data\\DESI FITS\\DESI_dwarf_AGN_fits"
+#file_dir = "C:\\DESI_fits_images\\DESI_dwarf_AGN_fits"
 # object_id = "39627841612027510"
 # id_n_z = (,)
 object_info = (39633244085289292,173.47971,49.84688, 0.0821)
+object_info = (39628516576202568,144.50186,31.63659,0.02251)
+object_info = (39627847656019106,150.98807,2.41803,0.02661)
 # object_info = (39633293687129181,212.82599,52.89456,0.07559)
 # object_info = (39627884997902878,218.32299,3.9033,0.02958)
 # object_info = (39627842752876903,218.68445,2.20796,0.06553)
@@ -93,9 +96,10 @@ as_table['xcentroid'] = tractor_x_pix
 as_table['ycentroid'] = tractor_y_pix
 phot_sources = as_table['type','xcentroid','ycentroid']
 pix_scale = 1.72
+pix_scale = 1
 raw_image = all_bands['r']
 
-results = gl.clean_image(raw_image, redshift=redshift, wcs=wcs, mask_stars = True, show_plots=True, deblend_sources = True,
+results = gl.clean_image(raw_image, redshift=redshift, wcs=wcs, mask_stars = True, show_plots=False, deblend_sources = True,
                          mask_sec_objects = True, clean_artifacts = True, phot_sources = phot_sources, source_pos=source_pos,
                          pix_scale = pix_scale, verbose = True, skip_flagged_artifacts = False)
 
@@ -103,12 +107,13 @@ clean_image, seg_map, removal_mask, cleaning_flags = results
 
 print(cleaning_flags)
 fig, ax = plt.subplots(2,2, figsize = (6,6))
-ax[0,0].imshow(raw_image-np.min(raw_image), norm = "log", origin = "lower", cmap = "gray")
+ax[0,0].imshow(raw_image-np.min(raw_image)+0.05, norm = "log", origin = "lower", cmap = "magma")
 ax[0,0].set_title("Raw image")
-ax[0,1].imshow(clean_image-np.min(clean_image), norm = "log", origin = "lower", cmap = "gray")
+ax[0,1].imshow(clean_image-np.min(clean_image)+0.005, norm = "log", origin = "lower", cmap = "magma")
 ax[0,1].set_title("Clean image")
 ax[1,0].imshow(seg_map, origin = "lower")
 ax[1,0].set_title("Segmentation map")
 ax[1,1].imshow(removal_mask, origin = "lower")
 ax[1,1].set_title("Removal mask")
+plt.tight_layout()
 plt.show()

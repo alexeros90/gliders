@@ -13,9 +13,6 @@ import astropy.units as u
 from astropy.coordinates import SkyCoord
 import time
 
-from sympy.physics.units import newton
-
-
 def smooth_region_edge(image, region_mask, bordering_mask = None, layers = 5, background = 0, background_std = 0,
                        pix_scale = 1, linear_weights = False):
     if bordering_mask is None:

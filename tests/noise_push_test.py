@@ -8,10 +8,10 @@ from astropy.wcs import WCS
 from gliders.utils import sigma_clipping, grow_mask
 from gliders.artifacts import detect_artifacts, get_artifact_flag, clean_artifacts, detect_and_clean_artifacts
 from gliders.utils import grow_mask, get_profile_from_border, normalize_data
-from gliders.noise_pusher import diminish_noise_level
+from gliders.background_suppressor import suppress_background
 from scipy.stats import norm
 from scipy.signal import convolve2d
-from gliders.noise_pusher import get_kernel
+from gliders.background_suppressor import get_kernel
 
 
 def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):

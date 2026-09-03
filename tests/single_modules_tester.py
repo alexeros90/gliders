@@ -8,7 +8,7 @@ from astropy.wcs import WCS
 from gliders.utils import sigma_clipping, grow_mask
 from gliders.artifacts import detect_artifacts, get_artifact_flag, clean_artifacts, detect_and_clean_artifacts
 from gliders.utils import grow_mask, get_profile_from_border, normalize_data
-from gliders.noise_pusher import diminish_noise_level
+from gliders.background_suppressor import suppress_background
 
 
 def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
@@ -126,7 +126,7 @@ for object_info in artif_catalog:
     clean_image_noise_mean, clean_image_noise_std = sigma_clipping(image)
     from scipy.stats import norm
     from scipy.signal import convolve2d
-    from gliders.noise_pusher import get_kernel
+    from gliders.background_suppressor import get_kernel
     kernel = get_kernel(type=8, center_weight=1.0)
 
     # p_map = norm.sf(clean_image.flatten(), loc=clean_image_noise_mean, scale=clean_image_noise_std)  # sf = 1 - cdf = survival function
@@ -185,7 +185,7 @@ for object_info in artif_catalog:
     # pushed_image = diminish_noise_level(clean_image, method = "logit", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
     # pushed_image = diminish_noise_level(clean_image, method = "product", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
     # pushed_image = diminish_noise_level(clean_image, method = "meta", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
-    pushed_image = diminish_noise_level(clean_image, method = "meta_prod", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
+    pushed_image = suppress_background(clean_image, method ="meta_prod", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
 
 
     fig, ax =  plt.subplots(2,2, figsize=(10,10))

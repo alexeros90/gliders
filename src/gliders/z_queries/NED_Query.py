@@ -44,12 +44,12 @@ def get_ned_sources(ra_center, dec_center, radius_arcmin=5, only_spec_z = False,
     """
     Ned.TIMEOUT = timeout
     # print("NED.TIMEOUT:",Ned.TIMEOUT)
-
+    radius_deg = radius_arcmin/60
     pos = SkyCoord(ra=ra_center, dec=dec_center, unit=(u.deg, u.deg))
     # Query NED around that position
 
     try:
-        result = Ned.query_region(pos, radius=radius_arcmin*u.arcmin)
+        result = Ned.query_region(pos, radius=radius_deg*u.deg)
     except Exception as e:
         print(f"❌ NED Query failed: {e}")
         raise e
