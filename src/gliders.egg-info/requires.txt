@@ -1,0 +1,8 @@
+numpy
+scipy
+astropy
+photutils
+pandas
+scikit-image
+opencv-python
+sep

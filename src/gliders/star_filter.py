@@ -141,7 +141,7 @@ def process_one_star(this_star, image, params):
         fill_value
     ) = params
 
-    y_cen, x_cen = this_star['ycentroid'], this_star['xcentroid']
+    y_cen, x_cen = this_star['y_centroid'], this_star['x_centroid']
     candidate_pos = (int(round(y_cen)), int(round(x_cen)))
     candidate_centroid = candidate_pos
     # Clip centroid so it is always within the image.
@@ -359,10 +359,10 @@ def star_detection_filtering(image, stars_detected, min_radius=2, max_radius=15,
         plt.imshow(image, norm='log', origin='lower', cmap='grey')
         for fstr in stars_detected:
             thecol = "orange"
-            circle = plt.Circle((fstr['xcentroid'], fstr['ycentroid']), fstr['r'], color=thecol, fill=False,
+            circle = plt.Circle((fstr['x_centroid'], fstr['y_centroid']), fstr['r'], color=thecol, fill=False,
                                 linewidth=1.5)
             plt.gca().add_artist(circle)
-            plt.text(fstr['xcentroid'], fstr['ycentroid'], s=f"{fstr['id']}")
+            plt.text(fstr['x_centroid'], fstr['y_centroid'], s=f"{fstr['id']}")
         plt.show()
 
     return final_stars

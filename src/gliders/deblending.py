@@ -1,29 +1,163 @@
 import numpy as np
 from photutils.segmentation import SourceCatalog, deblend_sources, detect_threshold, SegmentationImage
-from scipy.ndimage import label, generate_binary_structure, binary_dilation
+from scipy.ndimage import generate_binary_structure, binary_dilation
 import sep
 import warnings
-from .utils import (get_main_source_label,separate_segments, get_nearby_z_sources, coords_to_pixels, get_image_centroid, get_box_bounds,
-                    sigma_clipping, grow_mask, replace_mask_with_noise, interpolate_image, add_noise_to_region,
-                    estimate_overlapping_portion, contour_interpolation, get_aspect_ratio, smooth_region_edge)
+from .utils import (get_main_source_label, separate_segments, get_image_centroid, sigma_clipping, grow_mask,
+                    replace_mask_with_noise, interpolate_image, add_noise_to_region, estimate_overlapping_portion,
+                    contour_interpolation, smooth_region_edge, get_z_sources_in_image)
 
 
-def deblend_and_mask_sources(image, image_convolved = None, main_source_segment = None, source_pos = None, config = None,
-                             use_redshift = True, ref_redshift = None, max_delta_z = 0.005, use_photo_type = True,
-                             phot_sources = None, keep_undecided_segments = True, wcs = None, pix_scale=1,
-                             synch_z_query = True, z_query_timeout = 60, show_plots=False, verbose=False):
+def deblend_and_mask_sources(image, image_filtered = None, seg_map = None, source_pos = None, config = None,
+                             use_redshift = True, ref_redshift = None, max_delta_z = 0.005, z_sources = None, query_z_sources = True,
+                             wcs = None, z_query_timeout = 60, z_query_synch = True, use_photo_type = True, phot_sources = None,
+                             keep_undecided_segments = True, pix_scale=1, show_plots=False, verbose=False):
+    """
+    Deblend overlapping sources and remove contaminating objects from an image.
 
-    # Determining the minimum number of pixels for de-blending
+    This function identifies the main source in a segmentation map based on its
+    provided position, performs source deblending, evaluates the resulting segments
+    using redshift and/or photometric information, and removes segments that are
+    determined not to belong to the target object. A boolean mask of all removed
+    pixels is also returned.
+
+    Parameters
+    ----------
+    image : ndarray
+        Two-dimensional image containing the target source and surrounding
+        objects.
+
+    image_filtered : ndarray, optional
+        Filtered or convolved version of ``image`` used for source deblending.
+        If None, the input ``image`` is used.
+
+    seg_map : photutils.segmentation.SegmentationImage, optional
+        Segmentation map identifying detected sources in the image. If None,
+        the input image is returned unchanged.
+
+    source_pos : tuple of int, optional
+        Pixel coordinates ``(x, y)`` of the target source. If None, the image
+        center is assumed.
+
+    config : object, optional
+        Configuration object containing deblending and source-removal
+        parameters. If None, the default cleaning configuration is used.
+
+    use_redshift : bool, default=True
+        Whether spectroscopic/photometric redshift information should be used
+        to determine whether deblended segments belong to the main source.
+
+    ref_redshift : float, optional
+        Reference redshift of the target object. If provided, candidate sources
+        with redshifts differing by more than ``max_delta_z`` may be removed.
+
+    max_delta_z : float, default=0.005
+        Maximum allowed redshift difference between a segment and the target
+        source for them to be considered associated.
+
+    z_sources : astropy.table.Table, optional
+        Table containing redshift information for sources in the image. If
+        ``query_z_sources=True``, this parameter is overwritten by the query
+        results.
+
+    query_z_sources : bool, default=True
+        Whether to perform an external redshift query for sources detected in
+        the deblended segmentation map.
+
+    wcs : astropy.wcs.WCS, optional
+        World Coordinate System used to convert source positions into sky
+        coordinates for redshift catalog queries.
+
+    z_query_timeout : int, default=60
+        Timeout, in seconds, for redshift catalog queries.
+
+    z_query_synch : bool, default=True
+        If True, execute redshift queries synchronously. Otherwise, use the
+        asynchronous query mode supported by the underlying query function.
+
+    use_photo_type : bool, default=True
+        Whether to use photometric object classifications for evaluating
+        deblended segments. Artifacts (ATF) and stars (PSF) type objects
+        will be deblended.
+
+    phot_sources : astropy.table.Table, optional
+        Table containing photometric classifications for image sources.
+
+    keep_undecided_segments : bool, default=True
+        If True, segments for which insufficient information is available to
+        determine association with the main source are retained.
+
+    pix_scale : float, default=1
+        The scale of the artificial noise pixels added when removing contaminating
+        sources. If the image is correctly sampled w.r.t. the resolution, this value
+        should always be 1.
+
+    show_plots : bool, default=False
+        If True, display diagnostic plots generated during the analysis of
+        deblended segments.
+
+    verbose : bool, default=False
+        If True, print status messages and issue warnings describing the
+        processing steps and any fallback behavior.
+
+    Returns
+    -------
+    image : ndarray
+        Image after removal of contaminating deblended sources. If no valid
+        deblending is possible, the original image is returned.
+
+    deblending_mask : ndarray of bool
+        Boolean mask marking pixels belonging to sources that were removed
+        during the deblending process.
+
+    deblended_flag : bool
+        True if at least one contaminating source was successfully identified
+        and removed. False otherwise.
+
+    failed_z_query : bool
+        True if a redshift query was attempted but failed. False otherwise.
+
+    Notes
+    -----
+    The main source is identified as the segment associated with
+    ``source_pos``. De-blending is performed using the method specified in
+    ``config.deblend_tool`` and related configuration parameters.
+
+    Candidate segments can be evaluated using:
+
+    * Redshift consistency with the target source.
+    * Photometric source classifications.
+    * Geometric overlap criteria used during source removal.
+
+    If no segmentation map is provided, or the deblending process produces only
+    a single segment, the input image is returned unchanged.
+
+    See Also
+    --------
+    get_deblended_map
+        Generate a deblended segmentation map.
+
+    analyze_deblended_map
+        Classify deblended segments as associated or contaminating.
+
+    remove_deblended_objects
+        Remove contaminating sources from an image.
+    """
+
     deblended_flag = False
     failed_z_query = False
     deblending_mask = np.full_like(image, False, dtype=bool)
-    if main_source_segment is None:
+    default_return = image, seg_map, deblending_mask, deblended_flag, failed_z_query
+    if image_filtered is None:
         if verbose:
-            warnings.warn("Invalid main source segment, returning unmodified image and default values.",
-            UserWarning, stacklevel = 2)
-        return image, deblending_mask, deblended_flag, failed_z_query
-    if image_convolved is None:
-        image_convolved = image
+            warnings.warn("Invalid image_filtered. Will use raw image for deblending.",
+                          UserWarning, stacklevel=2)
+        image_filtered = image
+    if seg_map is None:
+        if verbose:
+            warnings.warn("Invalid seg_map, returning unmodified image and default values.",
+                          UserWarning, stacklevel = 2)
+        return default_return
     if config is None:
         if verbose:
             warnings.warn("No configuration object was provided. Will use default configuration.",
@@ -31,341 +165,408 @@ def deblend_and_mask_sources(image, image_convolved = None, main_source_segment 
         from .cleaning_configs import configs
         config = configs['default']
     if source_pos is None:
-        # If no source position is provided, we assume the source is located at the imag center.
+        if verbose:
+            warnings.warn("No main source position provided. Assuming main source is at image center.",
+                      UserWarning, stacklevel=2)
         ny, nx = image.shape
         source_pos = (nx // 2, ny // 2)
 
-    if use_redshift:
-        if ref_redshift is None:
-            use_redshift = False
-            if verbose:
-                warnings.warn("No reference redshift was provided. Redshift-based deblending will be omitted.",
-                              UserWarning, stacklevel=2)
-        elif max_delta_z is None: # and ref_redshift:
-            max_delta_z = config.deblend_max_delta_z
-            if verbose:
-                warnings.warn("Non valid input for max_delta_z. Will use value from configuration.",
-                              UserWarning, stacklevel=2)
-            if max_delta_z is None:
-                use_redshift = False
-                if verbose:
-                    warnings.warn("Non valid value for max_delta_z in configuration. Redshift-based deblending will be omitted.",
-                                  UserWarning, stacklevel=2)
+    src_cat = SourceCatalog(image, seg_map)
+    main_src_label = get_main_source_label(seg_map, source_pos=source_pos, table=src_cat.to_table())
+    main_source_npixels = seg_map.get_area(main_src_label)
 
-    main_source_mask = main_source_segment.make_source_mask()
-    source_npixels = main_source_mask.sum()
+    # Determining the minimum number of pixels for de-blending
+    npixels_deblend = max(int(main_source_npixels * config.npixels_deblend_factor), 1)
 
-    npixels_deblend = max(int(source_npixels * config.npixels_deblend_factor), 1)
-    # Getting the deblended candidates. We use the convolved image to smoothen the de-blending edges.
-
-    segmap_deblend = get_deblended_map(image_convolved, main_source_segment, config.deblend_tool,
-                                       npixels_deblend, config.deblend_contrast, config.deblend_levels,
-                                       config.deblend_mode, config.connect_mode, config.galaxy_detection_threshold)
-    if segmap_deblend is None:
+    # Getting the deblended candidates. We use the convolved image for better de-blending edges (especially if deblend_tool='sep').
+    seg_map_deblend = get_deblended_map(image_filtered, seg_map, config.deblend_tool, npixels_deblend,
+                                        config.deblend_contrast, config.deblend_levels, config.deblend_mode,
+                                        config.connect_mode, config.galaxy_detection_threshold)
+    if seg_map_deblend is None:
         if verbose:
             warnings.warn("No sources detected after de-blending, returning unmodified image and default values.",
-                UserWarning, stacklevel=2)
-        return image, deblending_mask, deblended_flag, failed_z_query
+                          UserWarning, stacklevel=2)
+        return default_return
 
-    elif len(segmap_deblend.labels) > 1:
-        deb_cat = SourceCatalog(image, segmap_deblend)
-        deb_main_label = get_main_source_label(segmap_deblend, source_pos=source_pos, table=deb_cat.to_table())
-        segmap_deblend, failed_z_query = analyze_deblended_map(segmap_deblend, deb_main_label, phot_sources, use_redshift, ref_redshift,
-                                               max_delta_z, use_photo_type, keep_undecided_segments, wcs, synch_z_query,
-                                               z_query_timeout, show_plots, verbose)
+    elif len(seg_map_deblend.labels) > 1:
+        # Segments may vary after deblending, so main source label has to be obtained again
+        deb_cat = SourceCatalog(image, seg_map_deblend)
+        deb_main_label = get_main_source_label(seg_map_deblend, source_pos=source_pos, table=deb_cat.to_table())
 
-        if len(segmap_deblend.labels) > 1:
-            image = remove_deblended_objects(image, segmap_deblend, deb_main_label,
+        if use_redshift and query_z_sources:
+            if wcs is None:
+                if verbose:
+                    warnings.warn("Cannot perform redshift query: The provided World Coordinate System (WCS) object is not valid",
+                              UserWarning, stacklevel=2)
+            else:
+                if verbose:
+                    print("Looking for nearby sources with available redshift...")
+                # z_sources query overrides the current content of z_sources
+                z_sources, failed_z_query = get_z_sources_in_image(seg_map_deblend, wcs, z_query_timeout, z_query_synch, z_query_attempts=2)
+
+        seg_map_deblend = analyze_deblended_map(seg_map_deblend, deb_main_label, use_redshift, ref_redshift,
+                                                max_delta_z, z_sources, use_photo_type, phot_sources,
+                                                keep_undecided_segments, show_plots, verbose)
+
+        if len(seg_map_deblend.labels) > 1:
+            image = remove_deblended_objects(image, seg_map_deblend, deb_main_label,
                                              overlap_portion_threshold=config.overlap_portion_threshold,
                                              pix_scale=pix_scale)
             deblended_flag = True
-            removal_segmap = segmap_deblend.copy()
+            removal_segmap = seg_map_deblend.copy()
             removal_segmap.remove_label(deb_main_label)
             deblending_mask = removal_segmap.make_source_mask()
 
     if verbose:
-        print("Detected", len(segmap_deblend.labels), "sources after de-blending.")
+        print("Detected", len(seg_map_deblend.labels), "sources after de-blending.")
 
-    return image, deblending_mask, deblended_flag, failed_z_query
+    return image, seg_map_deblend, deblending_mask, deblended_flag, failed_z_query
 
 
-def get_deblended_map(image, seg_map, deblend_tool = 'sep', npixels = None, contrast = 0.005, levels = 32,
-                      deblend_mode = 'exponential', connect_mode = 8, detection_threshold = 5):
+def get_deblended_map(image, seg_map, deblend_tool = 'sep', npixels = 50, contrast = 0.005, levels = 32,
+                      deblend_mode = 'exponential', connect_mode = 8, detection_threshold = 5, verbose = False):
+    """
+    Deblend a segmentation map using either SEP or Photutils.
 
-    if npixels is None:
-        npixels = int(image.size*0.005)
+    Parameters
+    ----------
+    image : ndarray
+        Input image used for source deblending.
+    seg_map : photutils.segmentation.SegmentationImage
+        Input segmentation map.
+    deblend_tool : {'sep', 'phut'}, optional
+        Deblending backend to use. Defaults to ``'sep'``.
+    npixels : int, optional
+        Minimum number of connected pixels to be considered an
+        independent source.
+    contrast : float, optional
+        Minimum contrast ratio used to separate blended sources.
+        Smaller values result in more aggressive deblending.
+    levels : int, optional
+        Number of deblending thresholds.
+    deblend_mode : {'exponential', 'linear', 'sinh'}, optional
+        Multi-threshold spacing mode used by Photutils.
+        Ignored when ``deblend_tool='sep'``.
+    connect_mode : {4, 8}, optional
+        Pixel connectivity used by Photutils during deblending.
+        Ignored when ``deblend_tool='sep'``.
+    detection_threshold : float, optional
+        Detection threshold in units of the background noise level
+        (sigma). Only required when ``deblend_tool='sep'``.
+    verbose : bool, optional
+        Whether to display warnings and diagnostic messages.
+
+    Returns
+    -------
+    photutils.segmentation.SegmentationImage
+        Deblended segmentation map. If deblending fails, the input
+        segmentation map is returned unchanged.
+
+    Notes
+    -----
+    To maintain consistent results when using 'sep', if a filtered
+    image was used for the initial detection, the same filtered image and
+    detection_threshold should be used here.
+
+    For the SEP backend, the deblended segmentation map is constrained to
+    the footprint of the input segmentation map and is post-processed with
+    ``separate_segments()`` to remove fuzzy boundaries between labels.
+    """
+
+    if deblend_tool not in ["sep", "phut"]:
+        if verbose:
+            warnings.warn("Not a valid deblend_tool. Defaulting to 'sep'", UserWarning, stacklevel=2)
+        deblend_tool = "sep"
 
     if deblend_tool == "phut":
-        segmap_deblend_obj = deblend_sources(image, seg_map, npixels=npixels,
-                                             nlevels=levels,
-                                             contrast=contrast, progress_bar=False,
-                                             mode=deblend_mode,
-                                             connectivity=connect_mode)
+        seg_map_deb = deblend_sources(image, seg_map, npixels=npixels, nlevels=levels, contrast=contrast,
+                                      progress_bar=False, mode=deblend_mode, connectivity=connect_mode)
 
-    else:
-        threshold = detect_threshold(image, nsigma=detection_threshold)
+    elif deblend_tool == "sep":
+        threshold = detect_threshold(image, n_sigma=detection_threshold)
         try:
-            sources_sxt_table, segmap_deblend = sep.extract(image.astype(np.float32),
-                                                            thresh=threshold[0][0], segmentation_map=True,
-                                                            minarea=npixels, deblend_nthresh=levels,
-                                                            deblend_cont=contrast)
-            seg_map_mask = seg_map.make_source_mask()
-            segmap_deblend[~seg_map_mask] = 0.
-            segmap_deblend = separate_segments(segmap_deblend)
-            segmap_deblend_obj = SegmentationImage(segmap_deblend)
+            _, seg_map_deb_data = sep.extract(image.astype(np.float32), thresh=threshold.mean(), segmentation_map=True,
+                                              minarea=npixels, deblend_nthresh=levels, deblend_cont=contrast)
+            if seg_map is not None:
+                seg_map_mask = seg_map.make_source_mask()
+                seg_map_deb_data[~seg_map_mask] = 0.
+            seg_map_deb_data = separate_segments(seg_map_deb_data)
+            seg_map_deb = SegmentationImage(seg_map_deb_data)
         except Exception as e:
-            print("Could not perform deblending:")
-            print(e)
+            print(f"Could not perform deblending: {e}")
             return seg_map
 
+    return seg_map_deb
 
-    return segmap_deblend_obj
+def analyze_deblended_map(seg_map, main_label, use_redshift = True, redshift = None, max_delta_z = None,
+                          z_sources = None, use_photo_type = True, phot_sources = None, keep_undecided_labels = True,
+                          show_plots = False, verbose = False):
 
-def analyze_deblended_map(segmap_deblend, main_label, phot_sources = None, use_redshift = True, redshift = None,
-                          max_delta_z = None, use_photo_type = True, keep_undecided_labels = True, wcs = None,
-                          synch_z_query = True, z_query_timeout = 60, show_plots = False, verbose = False):
-    #TODO: if use_photo_type is True but no phot_sources list is given, it should be a warning and move on, instead of error as it is now
-    failed_z_query = False
-    if segmap_deblend is None:
-        print("Could not perform deblending: invalid segmentaion map")
-        return segmap_deblend, failed_z_query
+    """
+    Analyze a deblended segmentation map using redshift and photometric
+    source information.
 
-    segmap_deblend_initial = segmap_deblend.copy()
-    safe_label = int(np.max(segmap_deblend.labels) + 1)
-    discard_label = safe_label + 1
-    z_sources = None
+    Segments can be classified as safe or discarded based on nearby
+    redshifts and/or photometric source types (where redshift classification
+    has priority). Remaining undecided segments are either kept or discarded
+    according to ``keep_undecided_labels``. Safe segments touching the main
+    source are merged back into the final segmentation map.
+
+    Parameters
+    ----------
+    seg_map : photutils.segmentation.SegmentationImage
+        Deblended segmentation map.
+    main_label : int
+        Label of the main source.
+    use_redshift : bool, optional
+        Enable redshift-based classification.
+    redshift : float, optional
+        Redshift of the main source.
+    max_delta_z : float, optional
+        Maximum allowed redshift difference for association.
+    z_sources : astropy.table.Table, optional
+        Table of sources with spectroscopic redshifts in the image region.
+    use_photo_type : bool, optional
+        Enable photometric type-based classification.
+    phot_sources : astropy.table.Table, optional
+        Table of photometric source types in the image region.
+    keep_undecided_labels : bool, optional
+        Whether labels not classified by any criterion are retained.
+
+    Returns
+    -------
+    photutils.segmentation.SegmentationImage
+        Final cleaned segmentation map.
+    """
+
+    if seg_map is None:
+        warnings.warn("Could not perform deblending: invalid segmentation map",
+                      UserWarning, stacklevel=2)
+        return seg_map
+
+    safe_label_list = []
+    discard_label_list = []
+
     if use_redshift:
-        segmap_deblend, z_sources, failed_z_query = check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift,
-                                                                              max_delta_z, wcs = wcs, synch_z_query = synch_z_query, return_segmap_only = False,
-                                                                              z_query_timeout = z_query_timeout, show_plots = False, verbose = verbose)
+        if redshift is None:
+            if verbose:
+                warnings.warn("Omitting the redshift-based deblending: The provided redshift is not valid.",
+                              UserWarning, stacklevel=2)
+        elif max_delta_z is None:
+            if verbose:
+                warnings.warn("Omitting the redshift-based deblending: The provided max_delta_z is not valid.",
+                              UserWarning, stacklevel=2)
+        elif z_sources is None or (len(z_sources) < 1):
+            if verbose:
+                warnings.warn("Omitting the redshift-based deblending: The provided z_sources table appears to be empty.",
+                              UserWarning, stacklevel=2)
+        else:
+            safe_label_list, discard_label_list = _check_deblended_redshifts(seg_map, main_label, redshift,
+                                                                             max_delta_z, z_sources, safe_label_list,
+                                                                             discard_label_list, show_plots=False,
+                                                                             verbose=verbose)
+
     else:
         if verbose:
-            print("Deblending by source redshift is not activated.")
-    if show_plots:
-        segmap_deblend_z = segmap_deblend.copy()
+            print("Redshift-based deblending is not activated")
+
+    safe_label_list_z, discard_label_list_z = safe_label_list.copy(), discard_label_list.copy()
 
     if use_photo_type:
-        segmap_deblend = check_deblended_photo_sources(segmap_deblend, main_label, safe_label, discard_label,
-                                                       phot_sources, show_plots = False, verbose = verbose)
+        if phot_sources is None or (len(phot_sources) < 1):
+            if verbose:
+                warnings.warn("Omitting the photometric type-based deblending: The provided phot_sources table appears to be empty.",
+                              UserWarning, stacklevel=2)
+        else:
+            safe_label_list, discard_label_list = _check_deblended_photo_sources(seg_map, main_label, phot_sources, safe_label_list,
+                                                         discard_label_list, show_plots = False, verbose = verbose)
     else:
         if verbose:
-            print("Deblending by source photometric type is not activated.")
-    if show_plots:
-        segmap_deblend_phot = segmap_deblend.copy()
+            print("Photometric type-based deblending is not activated")
 
-    undecided_segmap = segmap_deblend.copy()
+    safe_label_list_phot = [label for label in safe_label_list if label not in safe_label_list_z]
+    discard_label_list_phot = [label for label in discard_label_list if label not in discard_label_list_z]
 
-    exclude = [main_label, safe_label, discard_label]
+    exclude = [main_label] + safe_label_list + discard_label_list
 
     undecided_labels = [
-        label for label in undecided_segmap.labels
+        label for label in seg_map.labels
         if label not in exclude
     ]
 
     if len(undecided_labels) > 0:
         if keep_undecided_labels:
-            segmap_deblend.reassign_labels(labels=undecided_labels, new_label=safe_label)
+            safe_label_list += undecided_labels
         else:
-            segmap_deblend.reassign_labels(labels=undecided_labels, new_label=discard_label)
+            discard_label_list += undecided_labels
 
-    segmap_deblend = merge_touching_regions(segmap_deblend, main_label, safe_label)
-    segmap_deblend_split = segmap_deblend.data.copy()
-    segmap_deblend_split[segmap_deblend_split==discard_label] = segmap_deblend_initial.data[segmap_deblend_split==discard_label]
-    segmap_deblend = SegmentationImage(segmap_deblend_split)
-
-    if show_plots:
-        plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z, segmap_deblend_phot, segmap_deblend, redshift,
-                            z_sources, phot_sources)
-
-    return segmap_deblend, failed_z_query
-
-def check_deblended_redshifts(segmap_deblend, main_label, safe_label, discard_label, redshift, max_delta_z, wcs = None,
-                              synch_z_query = True, return_segmap_only = False, z_query_timeout = 60, show_plots = False,
-                              verbose = False):
-    if redshift is None:
-        print("The provided redshift is not valid. Redshift-based deblending will be omitted.")
-        return segmap_deblend
-
-    if wcs is None:
-        print("World Coordinate System (WCS) object must be provided to find nearby redshifts")
-        return segmap_deblend
-
-    non_main_segmap = segmap_deblend.copy()
-    non_main_segmap.remove_label(main_label)
-
-    if not len(non_main_segmap.labels) > 0:
-        if verbose:
-            print("No labels found besides main and background.")
-        return segmap_deblend
-
-    image_bounds = get_box_bounds(wcs, segmap_deblend.shape)
-    image_h, image_w = segmap_deblend.data.shape
-    if verbose:
-        print("Looking for nearby sources with available redshift")
-    nearby_sources, failed_z_query = get_nearby_z_sources(image_bounds, timeout=z_query_timeout, synchronous = synch_z_query, attempts = 2)
-
-    if not len(nearby_sources)>0:
-        if verbose:
-            print("No nearby redshift sources detected.")
-        if return_segmap_only:
-            return segmap_deblend
-        else:
-            return segmap_deblend, nearby_sources, failed_z_query
-
-    nearby_sources = coords_to_pixels(nearby_sources, wcs)
-    # print(nearby_sources.to_string())
+    # Ultimately, only safe segments that are in contact with the main segment are kept.
+    seg_map_out = seg_map.copy()
+    seg_map_out = _merge_touching_segments(seg_map_out, main_label, safe_label_list)
 
     if show_plots:
-        import matplotlib.pyplot as plt
-        fg, axo = plt.subplots(1, 2)
-        axo[0].imshow(segmap_deblend, origin="lower")
+        safe_label = int(np.max(seg_map_out.labels) + 1)
+        discard_label = safe_label + 1
+        seg_map_z = seg_map.copy()
+        if safe_label_list_z:
+            seg_map_z.reassign_labels(labels=safe_label_list_z, new_label=safe_label)
+        if discard_label_list_z:
+            seg_map_z.reassign_labels(labels=discard_label_list_z, new_label=discard_label)
+        seg_map_phot = seg_map_z.copy()
+        if safe_label_list_phot:
+            seg_map_phot.reassign_labels(labels=safe_label_list_phot, new_label=safe_label)
+        if discard_label_list_phot:
+            seg_map_phot.reassign_labels(labels=discard_label_list_phot, new_label=discard_label)
 
-    labels_to_save = []
-    labels_to_discard = []
+        _plot_deblended_maps(seg_map, seg_map_z, seg_map_phot, seg_map_out, redshift, z_sources, phot_sources)
 
-    zs_x = np.clip(np.rint(nearby_sources['x_pos'].values).astype(int), 0, image_w - 1)
-    zs_y = np.clip(np.rint(nearby_sources['y_pos'].values).astype(int), 0, image_h - 1)
-    zs_z = nearby_sources['z'].values
-    for seg_label in non_main_segmap.labels:
-        if seg_label == discard_label or seg_label == safe_label:
-            continue
-        seg_mask = non_main_segmap.data == seg_label
-        inside = seg_mask[zs_y, zs_x]
-        if np.any(inside):
-            z_seps = np.abs(zs_z[inside] - redshift)
-            if np.any(z_seps <= max_delta_z):
-                labels_to_save.append(seg_label)
-            else:
-                labels_to_discard.append(seg_label)
-            if show_plots:
-                for x, y, z in zip(zs_x[inside], zs_y[inside], zs_z[inside]):
-                    axo[0].text(x, y, f"{z:.4f}")
+    return seg_map_out
 
-    if len(labels_to_save) > 0:
-        segmap_deblend.reassign_labels(labels=labels_to_save, new_label=safe_label)
-    if len(labels_to_discard) > 0:
-        segmap_deblend.reassign_labels(labels=labels_to_discard, new_label=discard_label)
+def remove_deblended_objects(image, seg_map, main_label, overlap_portion_threshold = 0.1, mask_radius_factor=1.0, pix_scale = 1):
+    """
+    Remove secondary/deblended sources from an astronomical image.
 
-    if show_plots:
-        axo[1].imshow(segmap_deblend, origin="lower")
-        plt.show()
-    if return_segmap_only:
-        return segmap_deblend
-    else:
-        return segmap_deblend, nearby_sources, failed_z_query
+    Identifies all segmented sources other than the specified main source,
+    processes them in order of decreasing distance from the main source
+    centroid, and replaces their contribution in the image with background
+    noise and/or interpolated values.
 
-def check_deblended_photo_sources(segmap_deblend, main_label, safe_label, discard_label, phot_sources,
-                                  show_plots = False, verbose = False):
-    if show_plots:
-        import matplotlib.pyplot as plt
-        fg, axo = plt.subplots(1, 2)
-        axo[0].imshow(segmap_deblend, origin="lower")
+    Secondary sources are handled differently depending on their spatial
+    relationship with the main source:
 
-    non_main_segmap = segmap_deblend.copy()
-    non_main_segmap.remove_label(main_label)
+    - Sources that do not touch the main source are removed by replacing
+      their mask with background noise.
+    - Sources fully contained within the main source are inpainted and
+      filled with background noise.
+    - Sources that overlap the main source are treated according to their
+      estimated overlapping fraction. Weakly overlapping sources are
+      removed and the resulting edge is smoothed, while strongly
+      overlapping sources are removed using contour-based interpolation.
 
-    if not len(non_main_segmap.labels) > 0:
-        if verbose:
-            print("No labels found besides main and background.")
-        return segmap_deblend
+    The size of the mask used to remove each secondary source is estimated
+    from its number of pixels using an empirical relation calibrated for
+    DESI Legacy Survey images. The resulting radius can be scaled with
+    ``mask_radius_factor``.
 
-    if phot_sources is None:
-        if verbose:
-            print("No photometric sources found in the image region.")
-    elif not len(phot_sources) > 0:
-        if verbose:
-            print("No photometric sources found in the image region.")
-        return segmap_deblend
+    Parameters
+    ----------
+    image : numpy.ndarray
+        Two-dimensional astronomical image containing the sources to be
+        removed.
 
-    image_h, image_w = segmap_deblend.data.shape
-    labels_to_discard = []
+    seg_map : photutils.segmentation.SegmentationImage
+        Segmentation map identifying the sources in ``image``. Source labels
+        are expected to be positive integers, with background pixels having
+        no source label.
 
-    ts_x = np.clip(np.rint(phot_sources['xcentroid']).astype(int), 0, image_w - 1)
-    ts_y = np.clip(np.rint(phot_sources['ycentroid']).astype(int), 0, image_h - 1)
-    ts_type = phot_sources['type']
+    main_label : int
+        Label identifying the primary source that should be preserved.
+        Secondary sources are removed relative to this source.
 
-    for seg_label in non_main_segmap.labels:
-        if seg_label == discard_label or seg_label == safe_label:
-            continue
-        seg_mask = non_main_segmap.data == seg_label
-        seg_centroid = get_image_centroid(seg_mask)
-        inside = seg_mask[ts_y, ts_x]
-        if np.any(inside):
-            dx = ts_x[inside] - seg_centroid[0]
-            dy = ts_y[inside] - seg_centroid[1]
-            dist2 = dx * dx + dy * dy
-            idx_closest = np.argmin(dist2)
-            closest_type = ts_type[inside][idx_closest]
-            if closest_type == "ATF":
-                labels_to_discard.append(seg_label)
-            elif closest_type == "PSF":
-                # We make sure that the segment shape is roughly consistent with a PSF object (star)
-                aspect_ratio = get_aspect_ratio(seg_mask)
-                if aspect_ratio >= 0.3:
-                    labels_to_discard.append(seg_label)
-            if show_plots:
-                axo[0].text(ts_x[inside][idx_closest], ts_y[inside][idx_closest], closest_type)
+    overlap_portion_threshold : float, optional
+        Threshold on the estimated overlapping fraction used to distinguish
+        weakly from strongly overlapping secondary sources. Sources with
+        an overlapping portion smaller than this value are treated as
+        weakly overlapping. Default is 0.1.
 
-    if len(labels_to_discard) > 0:
-        segmap_deblend.reassign_labels(labels=labels_to_discard, new_label=discard_label)
-    if show_plots:
-        axo[1].imshow(segmap_deblend, origin="lower")
-        plt.show()
-    return segmap_deblend
+    mask_radius_factor : float, optional
+        Multiplicative factor applied to the empirically estimated mask
+        radius used when growing each secondary-source mask. A value of
+        ``1`` uses the nominal calibrated radius. Values greater than or
+        less than ``1`` increase or decrease the size of the removal
+        region, respectively. The resulting radius is always at least
+        one pixel. Default is 1.
 
+    pix_scale : float, optional
+        The scale of the artificial noise pixels added when removing contaminating
+        sources. If the image is correctly sampled w.r.t. the resolution, this value
+        should always be 1.
 
-def remove_deblended_objects(image, segmap_deblend, main_label, overlap_portion_threshold, pix_scale):
+    Returns
+    -------
+    numpy.ndarray
+        The image after removal of the secondary/deblended sources.
 
-    background, background_std = sigma_clipping(image, 3)
-    all_sources_mask = segmap_deblend.make_source_mask()
-    sec_labels = segmap_deblend.labels
+    Notes
+    -----
+    The secondary sources are processed from the furthest to the closest
+    relative to the centroid of the main source. This ordering is intended
+    to ensure that more distant sources are removed before sources that
+    are closer to, or overlapping with, the main source.
+
+    The mask radius for each secondary source is calculated from its number
+    of segmented pixels using the empirical relation
+
+    ``r = 0.7419 + 0.0066 * N_pix``,
+
+    which was calibrated for DESI Legacy Survey images. The radius is then
+    multiplied by ``mask_radius_factor`` and rounded to the nearest integer.
+
+    """
+
+    all_sources_mask = seg_map.make_source_mask()
+
+    catalog = SourceCatalog(image, seg_map)
+
+    sec_labels = seg_map.labels
     sec_labels = sec_labels[sec_labels != main_label]
-    main_source_mask = segmap_deblend.data == main_label
+    main_source_mask = seg_map.data == main_label
+
     # First we sort the objects by proximity to main source (the furthest first)
-    main_obj_centroid = get_image_centroid(segmap_deblend.data == main_label)
+    main_source_segment = catalog.select_label(main_label)
+    main_source_centroid = main_source_segment.centroid
     distances_to_main_centroid = []
-    for this_source_label in sec_labels:
-        sec_centroid = get_image_centroid(segmap_deblend.data == this_source_label)
-        distances_to_main_centroid.append(np.sqrt((sec_centroid[0] - main_obj_centroid[0]) ** 2 + (sec_centroid[1] - main_obj_centroid[1]) ** 2))
+    for source_segment in catalog:
+        if source_segment.label == main_label:
+            continue
+        sec_centroid = source_segment.centroid
+        distance = np.hypot(sec_centroid[0] - main_source_centroid[0], sec_centroid[1] - main_source_centroid[1])
+        distances_to_main_centroid.append(distance)
     distances_to_main_centroid = np.array(distances_to_main_centroid)
-    sort_idx = np.argsort(distances_to_main_centroid)
-    sort_idx = sort_idx[::-1]
+    sort_idx = np.argsort(distances_to_main_centroid)[::-1]
     sec_labels = sec_labels[sort_idx]
 
     # Now we treat each object
+    background_lvl, background_std = sigma_clipping(image, 3)
     for this_source_label in sec_labels:
-        # this_source_mask = grow_mask(segmap_deblend.data == this_source_label, 2)
-        this_source_mask = segmap_deblend.data == this_source_label
+
+        this_source_mask = seg_map.data == this_source_label
+
         all_but_this_source_mask = all_sources_mask & ~this_source_mask
-        target_pix_number = np.sum(this_source_mask)
-        mask_radius = round(np.sqrt(target_pix_number) / 2)
-        mask_growth = round(mask_radius / 2)
-        if mask_growth < 1:
-            mask_growth = 1
-        # We grow the region but make sure that it does not invade any other regions besides the background so we only mask the most outer pixels
-        this_source_mask_adjusted = grow_mask(this_source_mask, mask_growth) & ~all_but_this_source_mask
-        in_contact_with_main = are_regions_in_contact(segmap_deblend.data, main_label, this_source_label)
+        target_area = np.sum(this_source_mask)
+
+        # mask_radius_cal = 0.74 + 0.0066 * target_area
+        mask_radius_cal = -2.93 + 0.35 * np.sqrt(target_area) # Approx. radius for source profile to reach background + sigma level. Calibrated for DESI Legacy images
+        mask_radius = round(mask_radius_cal * mask_radius_factor)
+        mask_radius = max(1, mask_radius)
+        # print(mask_radius)
+
+        # Grow the region making sure it does not invade any other regions besides the background
+        this_source_mask_adjusted = grow_mask(this_source_mask, mask_radius) & ~all_but_this_source_mask
+        in_contact_with_main = _are_regions_in_contact(seg_map.data, main_label, this_source_label)
+
         if not in_contact_with_main:
-            image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_growth, scale=pix_scale)
+            image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, scale=pix_scale)
             continue
-        secondary_is_contained = check_if_region_is_contained(segmap_deblend.data, this_source_label, main_label)
+        secondary_is_contained = _check_if_region_is_contained(seg_map.data, this_source_label, main_label)
         if secondary_is_contained:
             image = interpolate_image(image, this_source_mask, method = "inpaint")
             image = add_noise_to_region(image, this_source_mask, noise_center = 0, noise_std = background_std,
                                         scale=pix_scale)
         else:
-            overlapping_portion = estimate_overlapping_portion(segmap_deblend.data, main_label, this_source_label)
+            overlapping_portion = estimate_overlapping_portion(seg_map.data, main_label, this_source_label)
             if overlapping_portion < overlap_portion_threshold:
-                image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_growth, noise_factor=5,
-                                                scale = pix_scale, use_median=False, edge_smoothing_factor = 0)
+                image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, noise_factor=5,
+                                                scale = pix_scale, edge_smoothing_factor = 0)
                 smoothing_layers = round(np.sqrt(np.sum(main_source_mask)) / (2*np.pi))
                 image = smooth_region_edge(image, main_source_mask, this_source_mask_adjusted, smoothing_layers,
-                                           background, background_std, pix_scale = pix_scale)
+                                           background_lvl, background_std, pix_scale = pix_scale)
+
             else:
-                influence_radius = mask_radius * overlapping_portion * 2
+                influence_radius = mask_radius * overlapping_portion
                 image = replace_mask_with_noise(image, this_source_mask_adjusted, noise_factor=5, scale = pix_scale,
                                                 edge_smoothing_factor = 0.5)
-                layer_noise_sample = np.random.normal(loc=background, scale=background_std,
+                layer_noise_sample = np.random.normal(loc=background_lvl, scale=background_std,
                                                       size=np.sum(this_source_mask_adjusted))
                 image = contour_interpolation(this_source_mask_adjusted, image, connectivity=8,
                                               noise_sample=layer_noise_sample, decay_threshold=0.15,
@@ -373,7 +574,183 @@ def remove_deblended_objects(image, segmap_deblend, main_label, overlap_portion_
 
     return image
 
-def check_if_region_is_contained(segmap, inner_label, outer_label, connectivity=8):
+def _check_deblended_redshifts(seg_map, main_label, redshift, max_delta_z, nearby_z_sources = None,
+                               safe_labels = None, discard_labels = None, show_plots = False, verbose = False):
+    """
+    Classify deblended segments using nearby redshift information.
+
+    Segments containing at least one source within ``max_delta_z`` of the
+    target redshift are assigned the ``safe_label``. Segments containing only
+    incompatible redshifts are assigned the ``discard_label``.
+
+    Parameters
+    ----------
+    seg_map : photutils.segmentation.SegmentationImage
+        Input segmentation map
+    main_label : int
+        The label of the primary object
+    redshift : float
+        Target redshift of the main source.
+    max_delta_z : float
+        Maximum allowed redshift difference for association.
+    nearby_z_sources: astropy.table.Table, optional
+        Table of sources with spectroscopic redshifts in the image region
+    safe_labels : list
+        The list of labels that are already classified as "safe" (these labels will not be affected by this function)
+    discard_labels : list
+        The list of labels that are already classified as "discard" (these labels will not be affected by this function)
+
+    Returns
+    -------
+    list, list
+        Updated safe_labels and discard_labels lists.
+    """
+
+    if safe_labels is None:
+        safe_labels = []
+    if discard_labels is None:
+        discard_labels = []
+
+    non_main_segmap = seg_map.copy()
+    non_main_segmap.remove_label(main_label)
+
+    if not len(non_main_segmap.labels) > 0:
+        if verbose:
+            print("No labels found besides main. Skipping redshift check for deblending")
+        return seg_map
+    if nearby_z_sources is None or (len(nearby_z_sources) < 1):
+        if verbose:
+            warnings.warn("List of nearby sources appears to be empty.", UserWarning, stacklevel=2)
+        return safe_labels, discard_labels
+
+    image_h, image_w = seg_map.data.shape
+
+    nearby_z_sources_pd = nearby_z_sources.to_pandas()
+    zs_x = np.clip(np.rint(nearby_z_sources_pd['x_pos'].values).astype(int), 0, image_w - 1)
+    zs_y = np.clip(np.rint(nearby_z_sources_pd['y_pos'].values).astype(int), 0, image_h - 1)
+    zs_z = nearby_z_sources_pd['z'].values
+    zs_plot = {}
+
+    for seg_label in non_main_segmap.labels:
+        if seg_label in discard_labels or seg_label in safe_labels:
+            continue
+        seg_mask = non_main_segmap.data == seg_label
+        inside = seg_mask[zs_y, zs_x]
+        if np.any(inside):
+            z_seps = np.abs(zs_z[inside] - redshift)
+            if np.any(z_seps <= max_delta_z):
+                safe_labels.append(seg_label)
+            else:
+                discard_labels.append(seg_label)
+
+            zs_plot[seg_label] = {"pos_x": zs_x[inside],
+                                  "pos_y": zs_y[inside],
+                                  "z": np.round(zs_z[inside],4)}
+
+    if show_plots:
+        import matplotlib.pyplot as plt
+        seg_map_plot = seg_map.copy()
+        safe_label = int(np.max(seg_map_plot.labels) + 1)
+        discard_label = safe_label + 1
+
+        if len(safe_labels) > 0:
+            seg_map_plot.reassign_labels(labels=safe_labels, new_label=safe_label)
+        if len(discard_labels) > 0:
+            seg_map_plot.reassign_labels(labels=discard_labels, new_label=discard_label)
+        fig, ax = plt.subplots(1, 2)
+        ax[0].imshow(seg_map.data, origin="lower")
+        ax[1].imshow(seg_map_plot.data, origin="lower")
+        for lab in zs_plot.keys():
+            for zx, zy, zz in zip(zs_plot[lab]["pos_x"], zs_plot[lab]["pos_y"], zs_plot[lab]["z"]):
+                ax[0].text(zx, zy, f"{zz:.4f}", color = "red", ha = "center", va = "center", fontsize = 7)
+        plt.show()
+
+    return safe_labels, discard_labels
+
+def _check_deblended_photo_sources(seg_map, main_label, phot_sources = None, safe_labels = None, discard_labels = None,
+                                  show_plots = False, verbose = False):
+    """
+    Assign the object type to the segments based on the photometric which of the
+    objects within each segment is closest to the centroid. Segments assigned as
+    artifact (``ATF``) or star-like (``PSF``) are assigned the ``discard_label``.
+
+    Parameters
+    ----------
+    seg_map : photutils.segmentation.SegmentationImage
+        Input segmentation map
+    main_label : int
+        The label of the primary object
+    safe_labels : list
+        The list of labels that are already classified as "safe" (these labels will not be affected by this function)
+    discard_labels : list
+        The list of labels that are already classified as "discard" (these labels will not be affected by this function)
+    phot_sources : astropy.table.Table, optional
+        Table of photometric source types in the image region
+
+    Returns
+    -------
+    list, list
+        Updated safe_labels and discard_labels lists.
+    """
+
+    if safe_labels is None:
+        safe_labels = []
+    if discard_labels is None:
+        discard_labels = []
+
+    non_main_segmap = seg_map.copy()
+    non_main_segmap.remove_label(main_label)
+
+    if len(non_main_segmap.labels) == 0:
+        if verbose:
+            print("No labels found besides main. Skipping redshift check for deblending")
+        return seg_map
+
+    image_h, image_w = seg_map.data.shape
+
+    ps_x = np.clip(np.rint(phot_sources['x_centroid']).astype(int), 0, image_w - 1)
+    ps_y = np.clip(np.rint(phot_sources['y_centroid']).astype(int), 0, image_h - 1)
+    ps_type = phot_sources['type']
+
+    ps_plot = {}
+    for seg_label in non_main_segmap.labels:
+        if seg_label in discard_labels or seg_label in safe_labels:
+            continue
+        seg_mask = non_main_segmap.data == seg_label
+        seg_centroid = get_image_centroid(seg_mask)
+        inside = seg_mask[ps_y, ps_x]
+        if np.any(inside):
+            dx = ps_x[inside] - seg_centroid[0]
+            dy = ps_y[inside] - seg_centroid[1]
+            dist2 = dx**2 + dy**2
+            idx_closest = np.argmin(dist2)
+            closest_type = ps_type[inside][idx_closest]
+            if str(closest_type).strip() in {"ATF", "PSF"}:
+                discard_labels.append(seg_label)
+            ps_plot[seg_label] = {"pos_x":ps_x[inside][idx_closest],
+                                  "pos_y":ps_y[inside][idx_closest],
+                                  "type": closest_type}
+
+
+    if show_plots:
+        import matplotlib.pyplot as plt
+        seg_map_plot = seg_map.copy()
+        safe_label = int(np.max(seg_map_plot.labels) + 1)
+        discard_label = safe_label + 1
+        if len(discard_labels) > 0:
+            seg_map_plot.reassign_labels(labels=discard_labels, new_label=discard_label)
+
+        fig, axo = plt.subplots(1, 2)
+        axo[0].imshow(seg_map.data, origin="lower")
+        axo[1].imshow(seg_map_plot.data, origin="lower")
+        for lab in ps_plot.keys():
+            axo[0].text(ps_plot[lab]["pos_x"], ps_plot[lab]["pos_y"], ps_plot[lab]["type"], color = "red",
+                        ha = "center", va = "center", fontsize = 7)
+        plt.show()
+
+    return safe_labels, discard_labels
+
+def _check_if_region_is_contained(segmap, inner_label, outer_label, connectivity=8):
     """
     Checks if all pixels of inner_val are fully contained inside outer_val.
 
@@ -425,7 +802,7 @@ def check_if_region_is_contained(segmap, inner_label, outer_label, connectivity=
 
     return True
 
-def are_regions_in_contact(array, region1_values, region2_values):
+def _are_regions_in_contact(array, region1_values, region2_values):
     """
     Checks whether any pixel from region1 is adjacent to any pixel from region2.
 
@@ -453,81 +830,127 @@ def are_regions_in_contact(array, region1_values, region2_values):
                         return True
     return False
 
-def merge_touching_regions(segment, main_label, seg_label, connectivity=8):
+def _merge_touching_segments(seg_map, main_label, sec_labels=None, connectivity=8):
     """
-    Check all disjoint regions with the same label (seg_label) and merge
-    only those that touch the main_label region into main_label.
+    Merge secondary regions connected to a main region.
+
+    ```
+    Identifies the regions in ``sec_labels`` that are connected to
+    ``main_label`` through a chain of touching regions. A secondary region
+    is merged if it directly touches ``main_label`` or touches another
+    secondary region that is itself connected to ``main_label``.
+
+    Adjacency is determined by the specified pixel connectivity. With
+    8-connectivity, diagonal neighbors are considered touching; with
+    4-connectivity, only horizontal and vertical neighbors are considered
+    touching.
+
+    The input segmentation map is not modified; a copy is returned with
+    all connected secondary regions reassigned to ``main_label``.
 
     Parameters
     ----------
-    segm : photutils.segmentation.SegmentationImage
-        Input segmentation map.
-    main_label : int
-        Label of the main segment.
-    seg_label : int
-        Label to test for contact against main_label.
-    connectivity : {4, 8}, optional
-        Pixel connectivity definition (default=8).
+    seg_map
+        Segmentation map containing the labeled regions.
+    main_label
+        Label of the main region from which connectivity is evaluated.
+    sec_labels : sequence of int, optional
+        Labels of secondary regions eligible for merging. If ``None`` or
+        empty, the input segmentation map is returned unchanged.
+    connectivity : {4, 8}, default=8
+        Pixel connectivity used to determine whether regions are touching.
+        ``4`` considers horizontal and vertical neighbors only, while
+        ``8`` also considers diagonal neighbors.
 
     Returns
     -------
-    new_segm : photutils.segmentation.SegmentationImage
-        Updated segmentation image with touching regions merged into main_label.
+    SegmentationMap
+        A copy of ``seg_map`` in which every secondary region connected
+        to ``main_label`` through a chain of eligible touching regions
+        has been reassigned to ``main_label``.
+
     """
+    if not sec_labels:
+        return seg_map
 
-    data = segment.data.copy()
-    structure = np.ones((3, 3), dtype=bool) if connectivity == 8 else np.array(
-        [[0,1,0],[1,1,1],[0,1,0]], dtype=bool
-    )
+    if connectivity == 8:
+        structure = np.ones((3, 3), dtype=bool)
+    elif connectivity == 4:
+        structure = np.array(
+            [[0, 1, 0],
+             [1, 1, 1],
+             [0, 1, 0]],
+            dtype=bool,
+        )
+    else:
+        raise ValueError("connectivity must be 4 or 8")
 
-    main_mask = data == main_label
-    seg_mask = data == seg_label
+    seg_map_out = seg_map.copy()
+    data = seg_map.data
 
-    # Label disjoint subregions within seg_label
-    subregions, n_subregions = label(seg_mask, structure=structure)
+    # Labels that have already been reached from the main region.
+    connected_labels = {main_label}
+    remaining_labels = set(sec_labels)
 
-    if n_subregions == 0:
-        return segment.copy()
+    # Start with the main region.
+    current_mask = data == main_label
 
-    dilated_main = binary_dilation(main_mask, structure=structure)
+    while remaining_labels:
+        dilated = binary_dilation(current_mask, structure=structure)
 
-    new_data = data.copy()
+        touching_labels = {
+            label
+            for label in remaining_labels
+            if np.any(dilated & (data == label))
+        }
 
-    for i in range(1, n_subregions + 1):
-        sub_mask = subregions == i
-        # If any pixel in the subregion touches main_label, merge it
-        if np.any(dilated_main & sub_mask):
-            new_data[sub_mask] = main_label
+        if not touching_labels:
+            break
 
-    return SegmentationImage(new_data)
+        connected_labels.update(touching_labels)
+        remaining_labels -= touching_labels
 
+        # Expand the region to include the newly connected labels.
+        for label in touching_labels:
+            current_mask |= data == label
 
-def plot_deblended_maps(segmap_deblend_initial, segmap_deblend_z, segmap_deblend_phot, segmap_deblend, redshift = None,
+    touching_labels = connected_labels - {main_label}
+
+    if touching_labels:
+        seg_map_out.reassign_labels(
+            labels=list(touching_labels),
+            new_label=main_label,
+        )
+
+    return seg_map_out
+
+def _plot_deblended_maps(seg_map_initial, seg_map_z, seg_map_phot, seg_map_final, redshift = None,
                         z_sources = None, phot_sources = None):
     import matplotlib.pyplot as plt
-    sdi_reset = segmap_deblend_initial.copy()
-    sdz_reset = segmap_deblend_z.copy()
-    sdp_reset = segmap_deblend_phot.copy()
-    sd_reset = segmap_deblend.copy()
-    for seg_map in (sdi_reset, sdz_reset, sdp_reset, sd_reset):
-        seg_map.relabel_consecutive()
-    fg, axo = plt.subplots(2, 2, figsize=(6, 7))
+    c_map = "viridis"
+    for this_seg_map in (seg_map_initial, seg_map_z, seg_map_phot, seg_map_final):
+        this_seg_map.relabel_consecutive()
+    fg, axo = plt.subplots(2, 2, figsize=(8, 10))
     fg.suptitle('Deblending maps')
-    axo[0, 0].imshow(sdi_reset, origin="lower")
+    axo[0, 0].imshow(seg_map_initial, origin="lower", cmap = c_map)
     axo[0, 0].set_title("initial")
-    axo[0, 1].imshow(sdz_reset, origin="lower")
+
+    axo[0, 1].imshow(seg_map_z, origin="lower", cmap = c_map)
     axo[0, 1].set_title("deblend z")
     if redshift is not None:
-        axo[0, 1].text(round(sdi_reset.data.shape[1]*0.02),round(sdi_reset.data.shape[0]*0.98), f'main z = {redshift:.4f}', color="lime", fontsize=10, ha='left',va='top')
-    # print(z_sources)
+        axo[0, 1].text(round(seg_map_z.data.shape[1]*0.02),round(seg_map_z.data.shape[0]*0.98), f'main z = {redshift:.4f}', color="lime", fontsize=10, ha='left',va='top')
+
     if z_sources is not None:
-        for row in z_sources[['x_pos', 'y_pos', 'z']].itertuples(index=False):
-            axo[0, 1].text(int(row.x_pos), int(row.y_pos), f'{row.z:.4f}', color="red", fontsize=7, ha='center', va='center')
-    axo[1, 0].imshow(sdp_reset.data, origin="lower")
+        for row in z_sources:
+            axo[0, 1].text(int(row['x_pos']), int(row['y_pos']), f'{row['z']:.4f}', color="red", fontsize=7, ha='center', va='center')
+
+    axo[1, 0].imshow(seg_map_phot.data, origin="lower", cmap = c_map)
     axo[1, 0].set_title("deblend phot")
     if phot_sources is not None:
-        for x, y, type in phot_sources['xcentroid', 'ycentroid', 'type'].iterrows():
+        for x, y, type in phot_sources['x_centroid', 'y_centroid', 'type'].iterrows():
             axo[1, 0].text(int(x), int(y), f'{type}', color="red", fontsize=6, ha='center', va='center')
-    axo[1, 1].imshow(sd_reset.data, origin="lower")
+
+    axo[1, 1].imshow(seg_map_final.data, origin="lower", cmap = c_map)
     axo[1, 1].set_title("final")
+
     plt.show()

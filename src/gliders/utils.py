@@ -1,7 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import asyncio
 import cv2
 from collections import Counter
 from scipy.ndimage import label, generate_binary_structure, binary_dilation, binary_erosion
@@ -11,6 +10,7 @@ from astropy.convolution import convolve, Gaussian2DKernel
 from scipy.interpolate import LinearNDInterpolator
 import astropy.units as u
 from astropy.coordinates import SkyCoord
+from astropy.table import Table
 import time
 
 def smooth_region_edge(image, region_mask, bordering_mask = None, layers = 5, background = 0, background_std = 0,
@@ -59,13 +59,16 @@ def check_edge_contact(mask):
     return np.any(edges)
 
 def get_main_source_label(seg_map, source_pos=(0, 0), table = []):
+    # We make sure positions in image are integers
+    source_pos = tuple(map(round, source_pos))
+
     main_label = seg_map.data[source_pos[1],source_pos[0]]
     if main_label > 0:
         return main_label
     else:
         closest_dist = np.sqrt(pow(seg_map.shape[0], 2) + pow(seg_map.shape[1], 2))
         for src in table:
-            this_dist = np.sqrt(pow(source_pos[0] - src['xcentroid'], 2) + pow(source_pos[1] - src['ycentroid'], 2))
+            this_dist = np.sqrt(pow(source_pos[0] - src['x_centroid'], 2) + pow(source_pos[1] - src['y_centroid'], 2))
             if this_dist < closest_dist:
                 main_label = src['label']
                 closest_dist = this_dist
@@ -287,6 +290,53 @@ def convolve_with_psf(image_data, kernel_std=2.0):
     psf = kernel.array  # we only need the numpy array
     convolved_image = convolve(image_data, psf)
     return convolved_image
+
+def _merge_touching_regions(regions_map, main_label, seg_label, connectivity=8):
+    """
+    Check all disjoint regions with the same label (seg_label) and merge
+    only those that touch the main_label region into main_label.
+
+    Parameters
+    ----------
+    regions_map : ndarray
+        Input regions map.
+    main_label : int
+        Label of the main segment.
+    seg_label : int
+        Label to test for contact against main_label.
+    connectivity : {4, 8}, optional
+        Pixel connectivity definition (default=8).
+
+    Returns
+    -------
+    new_regions_map : ndarray
+        Updated regions map with touching regions merged into main_label.
+    """
+
+    structure = np.ones((3, 3), dtype=bool) if connectivity == 8 else np.array(
+        [[0,1,0],[1,1,1],[0,1,0]], dtype=bool
+    )
+
+    main_mask = regions_map == main_label
+    seg_mask = regions_map == seg_label
+
+    # Label disjoint subregions within seg_label
+    subregions, n_subregions = label(seg_mask, structure=structure)
+
+    if n_subregions == 0:
+        return regions_map
+
+    dilated_main = binary_dilation(main_mask, structure=structure)
+
+    new_regions_map = regions_map.copy()
+
+    for i in range(1, n_subregions + 1):
+        sub_mask = subregions == i
+        # If any pixel in the subregion touches main_label, merge it
+        if np.any(dilated_main & sub_mask):
+            new_regions_map[sub_mask] = main_label
+
+    return new_regions_map
 
 def grow_mask(input_mask: np.ndarray, pixels: int) -> np.ndarray:
     """
@@ -646,26 +696,46 @@ def replace_mask_with_noise(input_image, mask, noise_factor=3, base_line_factor 
     return image
 
 def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration_limit=50, use_median=False,
-                   robust=True):
+                   use_iqr = False, robust=False, direction = "symmetric"):
     # Will return mean and standard deviation or median and iqr depending on use_median
     # If convergence_tolerance, the clipping will go on until there is no change in the central measurement or the iteration_limit is exceeded
+
+    def trim_data(data_in, direction, central_measure, sigma_factor, sigma):
+        if direction == "up":
+            threshold = central_measure - sigma_factor * sigma
+            data_out = data_in > threshold
+        elif direction == "down":
+            threshold = central_measure + sigma_factor * sigma
+            data_out = data_in < threshold
+        else:
+            threshold_hi = central_measure + sigma_factor * sigma
+            threshold_lo = central_measure - sigma_factor * sigma
+            data_out = (data_in < threshold_hi) & (data_in > threshold_lo)
+        return data_out
+
+    def get_measurements(data_in, use_median, use_iqr):
+        if use_median:
+            central_measure = np.median(data_in)
+        else:
+            central_measure = np.mean(data_in)
+
+        if use_iqr:
+            q25, q75 = np.percentile(data_in, [25, 75])
+            sigma = q75 - q25
+        else:
+            sigma = np.std(data_in, ddof=0)
+
+        return central_measure, sigma
 
     iter_count = 0
     mask = np.ones(image.shape, dtype=bool)
 
     # Initial stats
     masked_image = image[mask]
-    if use_median:
-        central_measure = np.median(masked_image)
-        q25, q75 = np.percentile(masked_image, [25, 75])
-        sigma = q75 - q25
-    else:
-        central_measure = np.mean(masked_image)
-        sigma = np.std(masked_image, ddof=0)
+    central_measure, sigma = get_measurements(masked_image, use_median, use_iqr)
 
     # Initial threshold
-    threshold = central_measure + sigma_factor * sigma
-    new_mask = image < threshold
+    new_mask = trim_data(image, direction, central_measure, sigma_factor, sigma)
 
     while iter_count < iteration_limit:
         masked_image = image[new_mask]
@@ -676,13 +746,7 @@ def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration
         else:
             trimmed = masked_image
 
-        if use_median:
-            new_central = np.median(trimmed)
-            q25, q75 = np.percentile(trimmed, [25, 75])
-            new_sigma = q75 - q25
-        else:
-            new_central = np.mean(trimmed)
-            new_sigma = np.std(trimmed, ddof=0)
+        new_central, new_sigma = get_measurements(trimmed, use_median, use_iqr)
 
         # Check convergence
         convergence_threshold = np.abs(sigma) * convergence_tolerance
@@ -697,8 +761,9 @@ def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration
         central_measure = new_central
         sigma = new_sigma
         mask = new_mask
-        threshold = central_measure + sigma_factor * sigma
-        new_mask = image < threshold
+
+        new_mask = trim_data(image, direction, central_measure, sigma_factor, sigma)
+
         iter_count += 1
 
     return central_measure, sigma
@@ -882,6 +947,16 @@ def separate_segments(labels, omit_background=True):
 
     return labels
 
+def get_z_sources_in_image(image, wcs, z_query_timeout, z_query_synch, z_query_attempts=2):
+    from .z_queries.z_fetcher import query_nearby_z_sources
+    image_bounds_coords = get_box_bounds(wcs, image.shape)
+    z_sources_from_query_df, failed_z_query = query_nearby_z_sources(image_bounds_coords,
+                                                                  timeout=z_query_timeout,
+                                                                  synchronous=z_query_synch, attempts=z_query_attempts)
+    z_sources_from_query_df = coords_to_pixels(z_sources_from_query_df, wcs)
+    z_sources_from_query = Table.from_pandas(z_sources_from_query_df)
+    return z_sources_from_query, failed_z_query
+
 def coords_to_pixels(sources, wcs):
     sources['x_pos'] = -1.
     sources['y_pos'] = -1.
@@ -893,7 +968,7 @@ def coords_to_pixels(sources, wcs):
     sources = sources[(sources['x_pos'] >= 0) & (sources['y_pos'] >= 0)]
     return (sources)
 
-def check_ra_range_leap(ra_range):
+def _check_ra_range_leap(ra_range):
     dir_dif = abs(ra_range[1] - ra_range[0])
     skip_dif = abs(ra_range[1] + 360 - ra_range[0])
     if dir_dif > skip_dif and (ra_range[1]<ra_range[0]):
@@ -901,140 +976,20 @@ def check_ra_range_leap(ra_range):
     else:
         return False
 
-async def _get_nearby_z_sources_async(image_bounds, timeout=60, max_attempts=2, retry_wait=2):
-    from gliders.z_queries.DESI_Query import get_desi_sources
-    from gliders.z_queries.SDSS_Query import get_sdss_square_region
-    from gliders.z_queries.NED_Query import get_ned_square_region
-    from gliders.z_queries.GAMA_Query import get_gama_sources
 
-    failed_query = False
+def square_region_from_cone_search(sources, RA_range, DEC_range):
+    leap_ra = _check_ra_range_leap(RA_range)
 
-    tasks = {
-        "DESI": _retry_async(lambda: asyncio.to_thread(get_desi_sources, image_bounds[0], image_bounds[1], timeout),
-            max_attempts, retry_wait),
-        "GAMA": _retry_async(lambda: asyncio.to_thread(get_gama_sources, image_bounds[0], image_bounds[1], timeout),
-            max_attempts, retry_wait),
-        "SDSS": _retry_async(lambda: asyncio.to_thread(get_sdss_square_region, image_bounds[0], image_bounds[1], 19, timeout),
-            max_attempts, retry_wait),
-        "NED": _retry_async(lambda: asyncio.to_thread(get_ned_square_region, image_bounds[0], image_bounds[1], True, timeout),
-            max_attempts, retry_wait),
-    }
-
-    completed = await asyncio.gather(
-        *tasks.values(),
-        return_exceptions=True
-    )
-
-    results = {}
-    for name, result in zip(tasks.keys(), completed):
-        if isinstance(result, Exception):
-            print(f"{name} failed: {result}")
-            results[name] = None
-            failed_query = True
+    if sources is not None:
+        if not leap_ra:
+            sources = sources[(sources['ra'] >= RA_range[0]) & (sources['ra'] <= RA_range[1]) &
+                              (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
         else:
-            results[name] = result
+            sources = sources[(((sources['ra'] >= RA_range[0]) & (sources['ra'] <= 360)) |
+                               ((sources['ra'] <= RA_range[1]) & (sources['ra'] >= 0))) &
+                              (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
 
-    return _combine_query_results(results), failed_query
-
-async def _retry_async_OLD(func, max_attempts, wait_seconds = 2):
-    last_exception = None
-    for attempt in range(max_attempts):
-        try:
-            return await func()
-        except Exception as e:
-            last_exception = e
-            if attempt < max_attempts - 1:
-                await asyncio.sleep(wait_seconds)
-    return last_exception
-
-
-#TEST MEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
-async def _retry_async(func, max_attempts, wait_seconds=2):
-    for attempt in range(max_attempts):
-        try:
-            return await func()
-        except Exception:
-            if attempt < max_attempts - 1:
-                await asyncio.sleep(wait_seconds)
-            else:
-                raise
-
-def _retry_sync(func, max_attempts, wait_seconds = 2):
-    last_exception = None
-    for attempt in range(max_attempts):
-        try:
-            return func()
-        except Exception as e:
-            last_exception = e
-            if attempt < max_attempts - 1:
-                time.sleep(wait_seconds)
-    raise last_exception
-
-def _get_nearby_z_sources_sync(image_bounds, timeout=60, max_attempts=2, retry_wait=2):
-    from gliders.z_queries.DESI_Query import get_desi_sources
-    from gliders.z_queries.SDSS_Query import get_sdss_square_region
-    from gliders.z_queries.NED_Query import get_ned_square_region
-    from gliders.z_queries.GAMA_Query import get_gama_sources
-
-    failed_query = False
-
-    results = {}
-
-    query_functions = {
-        "DESI": lambda: get_desi_sources(image_bounds[0], image_bounds[1], timeout),
-        "GAMA": lambda: get_gama_sources(image_bounds[0], image_bounds[1], timeout),
-        "SDSS": lambda: get_sdss_square_region(image_bounds[0], image_bounds[1], 19, timeout),
-        "NED":  lambda: get_ned_square_region(image_bounds[0], image_bounds[1], True, timeout),
-    }
-
-    for name, func in query_functions.items():
-        try:
-            results[name] = _retry_sync(func, max_attempts, retry_wait)
-        except Exception as e:
-            print(f"{name} failed: {e}")
-            results[name] = None
-            failed_query = True
-
-    return _combine_query_results(results), failed_query
-
-def _combine_query_results(results_dict):
-    """
-    Combine the dictionary of query results into a cleaned dataframe.
-    """
-
-    valid_dfs = [
-        df[["object_id", "ra", "dec", "z"]]
-        for df in results_dict.values()
-        if df is not None and not df.empty
-    ]
-
-    if valid_dfs:
-        all_z_sources = pd.concat(valid_dfs, ignore_index=True)
-    else:
-        all_z_sources = pd.DataFrame(
-            columns=["object_id", "ra", "dec", "z"]
-        )
-
-    all_z_sources = all_z_sources.dropna(subset=["z"])
-    all_z_sources["object_id"] = all_z_sources["object_id"].astype(str)
-
-    return all_z_sources
-
-def get_nearby_z_sources(image_bounds, timeout=60, synchronous=False, attempts = 2):
-
-    if synchronous:
-        return _get_nearby_z_sources_sync(image_bounds, timeout, max_attempts = attempts, retry_wait = 2)
-    else:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop → safe in scripts
-            return asyncio.run(_get_nearby_z_sources_async(image_bounds, timeout, max_attempts = attempts, retry_wait = 2) )
-        else:
-            raise RuntimeError(
-                "Active event loop detected. Use:\n\n"
-                "    await get_nearby_z_sources_async(...)"
-            )
+    return sources
 
 def contour_interpolation(region_mask, image, connectivity=8, add_noise=True, noise_sample=None, decay_threshold=0.1,
                           influence_radius=5):

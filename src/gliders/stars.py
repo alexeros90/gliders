@@ -89,10 +89,10 @@ def find_all_star_apertures(image, main_source_pos, phot_sources, safe_star_mask
                                                        config.star_sharpness_low, config.star_min_radius, config.sigma_radius)
                 if not isinstance(stars_detected, type(None)):
                     # Controlling that centroids are inside the image
-                    stars_detected['xcentroid'][stars_detected['xcentroid'] > image.shape[1] - 1] = image.shape[1] - 1
-                    stars_detected['xcentroid'][stars_detected['xcentroid'] < 0] = 0
-                    stars_detected['ycentroid'][stars_detected['ycentroid'] > image.shape[0] - 1] = image.shape[0] - 1
-                    stars_detected['ycentroid'][stars_detected['ycentroid'] < 0] = 0
+                    stars_detected['x_centroid'][stars_detected['x_centroid'] > image.shape[1] - 1] = image.shape[1] - 1
+                    stars_detected['x_centroid'][stars_detected['x_centroid'] < 0] = 0
+                    stars_detected['y_centroid'][stars_detected['y_centroid'] > image.shape[0] - 1] = image.shape[0] - 1
+                    stars_detected['y_centroid'][stars_detected['y_centroid'] < 0] = 0
                     stars_detected['type'] = 'PSF'
                     all_stars_detected_list.append(stars_detected)
 
@@ -226,7 +226,7 @@ def detect_stars_in_image(image, star_detection_threshold, star_detector, star_f
                                 min_separation = star_min_radius)
     stars_detected = finder(image)
     if not isinstance(stars_detected, type(None)):
-        stars_detected = stars_detected['id', 'xcentroid', 'ycentroid']
+        stars_detected = stars_detected['id', 'x_centroid', 'y_centroid']
     return stars_detected
 
 def get_star_apertures(stars_detected, default_radius = 2):
@@ -243,14 +243,14 @@ def get_star_apertures(stars_detected, default_radius = 2):
             radius = default_radius
         else:
             radius = this_star['r']
-        star_ap = CircularAperture((this_star['xcentroid'], this_star['ycentroid']), r=radius)
+        star_ap = CircularAperture((this_star['x_centroid'], this_star['y_centroid']), r=radius)
         detected_star_apertures['s_' + str(current_id)] = star_ap
         current_id += 1
     return detected_star_apertures
 
 def remove_redundant_star_detections(all_stars_detected, min_separation):
     ids_to_keep = []
-    positions = np.array([[star['xcentroid'], star['ycentroid']] for star in all_stars_detected])
+    positions = np.array([[star['x_centroid'], star['y_centroid']] for star in all_stars_detected])
     ids = np.array([star['id'] for star in all_stars_detected])
 
     for i, pos_i in enumerate(positions):

@@ -10,42 +10,46 @@ from .others import background_subtraction, mask_secondary_detections, clear_bac
 import traceback
 import time
 
+# TODO: Artifact, deblending and background suppressor are ready. Need to check: stars, utils, configs, others and pipeline!
+
 def update_sources(sources_table, artifact_mask):
     if (artifact_mask == True).any():
         artifact_segmap = detect_sources(artifact_mask, 0.5, 1, connectivity=8)
         artifact_table = SourceCatalog(artifact_mask, artifact_segmap).to_table()
-        artifact_table = artifact_table[['xcentroid', 'ycentroid']]
+        artifact_table = artifact_table[['x_centroid', 'y_centroid']]
         artifact_table['type'] = 'ATF'
         sources_table = vstack([sources_table, artifact_table])
     return sources_table
 
-def update_detections(image, config = None, source_min_pix = 1, source_pos = None, verbose = False):
+def update_detections(image, config = None, source_min_pix = 1, source_pos = None, use_filter = True, verbose = False):
     if config is None:
-        print("No config provided. Using default config.")
+        if verbose:
+            print("No config provided. Using default config.")
         from .cleaning_configs import configs
         config = configs["default"]
     if source_pos is None:
         ny, nx = image.shape
         source_pos = np.array((int(nx / 2), int(ny / 2)))
 
-    image_convolved = convolve_with_psf(image, kernel_std=config.psf_std)
-    threshold = detect_threshold(image_convolved, nsigma=config.galaxy_detection_threshold)
-    seg_map = detect_sources(image_convolved, threshold, source_min_pix, connectivity=config.connect_mode)
+    if use_filter:
+        image_for_detection = convolve_with_psf(image, kernel_std=config.psf_std)
+    else:
+        image_for_detection = image
+
+    threshold = detect_threshold(image_for_detection, n_sigma=config.galaxy_detection_threshold)
+    seg_map = detect_sources(image_for_detection, threshold, source_min_pix, connectivity=config.connect_mode)
     if not seg_map:
-        if verbose:
-            print("No sources detected in the convolved image, trying with the non-convolved image.")
-        seg_map = detect_sources(image, threshold, source_min_pix, connectivity=config.connect_mode)
-        if not seg_map:
-            raise Exception("No sources were detected in the image.")
+        raise Exception("No sources were detected in the image.")
+
     source_cat = SourceCatalog(image, seg_map)
     sources_table = source_cat.to_table()
     main_label = get_main_source_label(seg_map, source_pos = source_pos, table = sources_table)
     main_source_segmap = seg_map.copy()
     main_source_segmap.keep_label(label=main_label)
-    return image_convolved, seg_map, main_source_segmap
+    return image_for_detection, seg_map, main_source_segmap
 
-def clean_image(image, image_psf = None, config = None, source_pos = None, redshift = None, phot_sources = None,
-                wcs = None, return_clean_image_only = False, clean_artifacts = True, skip_flagged_artifacts = True,
+def clean_image(image, image_psf = None, config = None, source_pos = None, redshift = None, z_sources = None,
+                query_z_sources = True, wcs = None, phot_sources = None, clean_artifacts = True, skip_flagged_artifacts = True,
                 reduce_noise_level = False, subtract_background = False, mask_sec_objects = True, mask_stars = True,
                 deblend_sources = True, deblend_with_redshift = True, deblend_delta_z = None, keep_undecided_segments = True,
                 deblend_with_photo_type = True, robust_background = True, sync_z_query = False,
@@ -59,7 +63,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             from .cleaning_configs import configs
             config = configs["default"]
         if phot_sources is None:
-            phot_sources = Table(names=['type','xcentroid','ycentroid'], dtype=('str', 'float', 'float'))
+            phot_sources = Table(names=['type','x_centroid','y_centroid'], dtype=('str', 'float', 'float'))
         ny, nx = image.shape
         img_center = np.array((int(nx / 2), int(ny / 2)))
         img_bkg_lvl, img_bkg_lvl_std = sigma_clipping(image)
@@ -93,20 +97,21 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             # Non modified images with artifacts generally have pixels with values >> background, so first we filter based on that
             if (np.max(image)/img_bkg_lvl) > config.artifact_candidate_ratio:
                 image, artifact_mask, unsafe_artifact_flag = detect_and_clean_artifacts(image, config, img_bkg_lvl,
-                                                                                 pix_scale = pix_scale, main_source_pos=source_pos,
-                                                                                 skip_flagged_artifacts = skip_flagged_artifacts,
-                                                                                 verbose = verbose, show_plots=show_plots)
+                                                                                        pix_scale = pix_scale, main_source_pos=source_pos,
+                                                                                        skip_flagged_artifacts = skip_flagged_artifacts,
+                                                                                        verbose = verbose, show_plots=show_plots)
                 cleaning_mask = artifact_mask | cleaning_mask
                 phot_sources = update_sources(phot_sources, artifact_mask) # Adding detected artifacts to photo source table
                 # times["artifact_cleaning"] = time.perf_counter()
 
-        if reduce_noise_level:
-            image = suppress_background(image, method ="logit", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
-            # smooth_noise_curve must be False, otherwise sep deblending may not work correctly
 
         if subtract_background:
             image = background_subtraction(image, show_plots=False, normalize=False, detection_threshold=3, psf_kernel_std = config.psf_std)
             # times["background_subtraction"] = time.perf_counter()
+
+        if reduce_noise_level:
+            image = suppress_background(image, method ="logit", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
+            # smooth_noise_curve must be False, otherwise sep deblending may not work correctly
 
         # times["psf_convolution"] = time.perf_counter()
 
@@ -146,12 +151,15 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             if verbose:
                 print("Deblending sources...")
             z_timeout = config.z_query_timeout
-            image, deblending_mask, deblended_flag, deblend_bad_z_query_flag = deblend_and_mask_sources(image, image_convolved, main_source_segment,
-                                                                              source_pos, config, deblend_with_redshift,
-                                                                              redshift, deblend_delta_z, deblend_with_photo_type,
-                                                                              phot_sources, keep_undecided_segments,
-                                                                              wcs, pix_scale, sync_z_query, z_timeout,
-                                                                              show_plots = show_plots)
+
+            deblend_res = deblend_and_mask_sources(image, image_convolved, seg_map, source_pos, config,
+                                                   deblend_with_redshift, redshift, deblend_delta_z, z_sources,
+                                                   query_z_sources, wcs, z_timeout, sync_z_query,
+                                                   deblend_with_photo_type, phot_sources, keep_undecided_segments,
+                                                   pix_scale, show_plots = show_plots, verbose=verbose)
+
+            image, deb_seg_map, deblending_mask, deblended_flag, deblend_bad_z_query_flag = deblend_res
+
             cleaning_mask = deblending_mask | cleaning_mask
             # Updating the convolved image and segmentation map of the post-deblend main source
             image_convolved, seg_map, main_source_segment = update_detections(image, config, source_min_pix, source_pos, verbose)
@@ -200,10 +208,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         if verbose:
             print("Image cleaning finished!")
 
-        if return_clean_image_only:
-            return image
-        else:
-            return image, main_source_segment, cleaning_mask, cleaning_flags
+        return image, main_source_segment, cleaning_mask, cleaning_flags
 
     except Exception as e:
         print(traceback.format_exc())

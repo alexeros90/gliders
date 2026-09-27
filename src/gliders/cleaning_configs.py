@@ -47,10 +47,8 @@ class Config:
     deblend_mode: str # Deblending mode for photutils/sep
     deblend_levels: int # Deblending levels for photutils/sep
     deblend_contrast: float # Deblending contrast for photutils/sep
-    deblend_max_delta_z: float # A segment with a redshift difference higher than this with respect to the main segment will be deblended
     npixels_deblend_factor: float # The minimum amount of pixels for deblending detections will be the number of pixels of the main source times this
     deblend_tool: str # Which tool will be used if performing de-blending
-    # keep_undecided_segments: bool # If True the segments that were not confirmed nor discarded in the deblending analysis will be kept, otherwise they will be discarded.
     overlap_portion_threshold: float # The overlapping portion to determine the masking method on touching segments
     z_query_timeout: float # The times (in seconds) after which the redshift queries will be cancelled.
 
@@ -72,7 +70,7 @@ default_config = Config(artifact_delta_slope_threshold = 2.7, artifact_segment_s
                         star_filter_delta_slope_thres = 0.008, star_filter_prof_cos_dist_thresh = 0.045,
                         star_filter_mean_symmetry_ratio_thresh = 0.07, star_filter_gaussian_ratio_thresh = 1.2,
                         deblend_levels = 32, deblend_contrast = 0.005, npixels_deblend_factor = 0.005,
-                        deblend_max_delta_z = 0.0035, connect_mode = 8,
+                        connect_mode = 8,
                         psf_std = 1.0, star_fwhm_span = 1.0, star_filter_gaussian_fit_max_sigma = 4, artifact_rel_size_thresh = 0.005,
                         artifact_safe_region_radius = 0.25, artifact_bleeding_factor = 1.14, artifact_interpolation_radius = 1.0,
                         z_query_timeout = 60)
@@ -88,7 +86,7 @@ dagn_config = Config(artifact_delta_slope_threshold = 2.7, artifact_segment_slac
                      big_contaminator_pix_ratio = 0.03, star_filter_slope_thresh = -0.008, star_filter_delta_slope_thres = 0.008,
                      star_filter_prof_cos_dist_thresh = 0.045, star_filter_mean_symmetry_ratio_thresh = 0.07,
                      star_filter_gaussian_ratio_thresh = 1.2, deblend_levels = 32, deblend_contrast = 0.005,
-                     npixels_deblend_factor = 0.005, deblend_max_delta_z = 0.0035,
+                     npixels_deblend_factor = 0.005,
                      connect_mode = 8, psf_std = 1.0, star_fwhm_span = 1.0, star_filter_gaussian_fit_max_sigma = 4,
                      artifact_rel_size_thresh = 0.01, artifact_safe_region_radius = 0.25, artifact_bleeding_factor = 1.14,
                      artifact_interpolation_radius = 1.0, z_query_timeout = 30)
@@ -101,7 +99,7 @@ iraf_config = Config(artifact_delta_slope_threshold = 2.7, artifact_segment_slac
     overlap_portion_threshold = 0.2, big_contaminator_pix_ratio = 0.03,
     star_filter_slope_thresh = -0.008, star_filter_delta_slope_thres = 0.008, star_filter_prof_cos_dist_thresh = 0.045,
     star_filter_mean_symmetry_ratio_thresh = 0.07, star_filter_gaussian_ratio_thresh = 1.2,
-    deblend_levels = 30, deblend_contrast = 0.01, npixels_deblend_factor = 0.01, deblend_max_delta_z = 0.0035,
+    deblend_levels = 30, deblend_contrast = 0.01, npixels_deblend_factor = 0.01,
     connect_mode = 4, psf_std = 2.0, star_fwhm_span = 2.5, star_filter_gaussian_fit_max_sigma = 4, artifact_rel_size_thresh = 0.01,
                      artifact_safe_region_radius = 0.25, artifact_bleeding_factor = 1.14, artifact_interpolation_radius = 1.0
                      , z_query_timeout = 60)
@@ -116,7 +114,7 @@ non_processing_config = Config(artifact_delta_slope_threshold = 2.7, artifact_se
     overlap_portion_threshold = 0.2, big_contaminator_pix_ratio = 0.03,
     star_filter_slope_thresh = -0.008, star_filter_delta_slope_thres = 0.008, star_filter_prof_cos_dist_thresh = 0.045,
     star_filter_mean_symmetry_ratio_thresh = 0.07, star_filter_gaussian_ratio_thresh = 1.2,
-    deblend_levels = 10, deblend_contrast = 0.01, npixels_deblend_factor = 0.01, deblend_max_delta_z = 0.0035,
+    deblend_levels = 10, deblend_contrast = 0.01, npixels_deblend_factor = 0.01,
     connect_mode = 4, psf_std = 2.0, star_fwhm_span = 2.5,
     star_filter_gaussian_fit_max_sigma = 4, artifact_rel_size_thresh = 0.01, artifact_safe_region_radius = 0.25,
                                artifact_bleeding_factor = 1.14, artifact_interpolation_radius = 1.0

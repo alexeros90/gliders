@@ -93,9 +93,9 @@ for object_info in artif_catalog:
     tractor_x_pix, tractor_y_pix = wcs.all_world2pix(as_table['ra'], as_table['dec'], 0)  # origin=0 for Python indexing
     source_x_pix, source_y_pix = wcs.all_world2pix(obj_coords[0], obj_coords[1], 0)  # origin=0 for Python indexing
     source_pos = (np.round(source_x_pix), np.round(source_y_pix))
-    as_table['xcentroid'] = tractor_x_pix
-    as_table['ycentroid'] = tractor_y_pix
-    phot_sources = as_table['type','xcentroid','ycentroid']
+    as_table['x_centroid'] = tractor_x_pix
+    as_table['y_centroid'] = tractor_y_pix
+    phot_sources = as_table['type','x_centroid','y_centroid']
     image = all_bands['r']
 
 
