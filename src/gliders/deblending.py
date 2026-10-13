@@ -191,7 +191,7 @@ def deblend_and_mask_sources(image, image_filtered = None, seg_map = None, sourc
     elif len(seg_map_deblend.labels) > 1:
         # Segments may vary after deblending, so main source label has to be obtained again
         deb_cat = SourceCatalog(image, seg_map_deblend)
-        deb_main_label = get_main_source_label(seg_map_deblend, source_pos=source_pos, table=deb_cat.to_table())
+        main_label = get_main_source_label(seg_map_deblend, source_pos=source_pos, table=deb_cat.to_table())
 
         if use_redshift and query_z_sources:
             if wcs is None:
@@ -204,17 +204,17 @@ def deblend_and_mask_sources(image, image_filtered = None, seg_map = None, sourc
                 # z_sources query overrides the current content of z_sources
                 z_sources, failed_z_query = get_z_sources_in_image(seg_map_deblend, wcs, z_query_timeout, z_query_synch, z_query_attempts=2)
 
-        seg_map_deblend = analyze_deblended_map(seg_map_deblend, deb_main_label, use_redshift, ref_redshift,
+        seg_map_deblend = analyze_deblended_map(seg_map_deblend, main_label, use_redshift, ref_redshift,
                                                 max_delta_z, z_sources, use_photo_type, phot_sources,
                                                 keep_undecided_segments, show_plots, verbose)
 
         if len(seg_map_deblend.labels) > 1:
-            image = remove_deblended_objects(image, seg_map_deblend, deb_main_label,
+            image = remove_deblended_objects(image, seg_map_deblend, main_label,
                                              overlap_portion_threshold=config.overlap_portion_threshold,
                                              pix_scale=pix_scale)
             deblended_flag = True
             removal_segmap = seg_map_deblend.copy()
-            removal_segmap.remove_label(deb_main_label)
+            removal_segmap.remove_label(main_label)
             deblending_mask = removal_segmap.make_source_mask()
 
     if verbose:
@@ -556,7 +556,7 @@ def remove_deblended_objects(image, seg_map, main_label, overlap_portion_thresho
         else:
             overlapping_portion = estimate_overlapping_portion(seg_map.data, main_label, this_source_label)
             if overlapping_portion < overlap_portion_threshold:
-                image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, noise_factor=5,
+                image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, sigma_factor=5,
                                                 scale = pix_scale, edge_smoothing_factor = 0)
                 smoothing_layers = round(np.sqrt(np.sum(main_source_mask)) / (2*np.pi))
                 image = smooth_region_edge(image, main_source_mask, this_source_mask_adjusted, smoothing_layers,
@@ -564,7 +564,7 @@ def remove_deblended_objects(image, seg_map, main_label, overlap_portion_thresho
 
             else:
                 influence_radius = mask_radius * overlapping_portion
-                image = replace_mask_with_noise(image, this_source_mask_adjusted, noise_factor=5, scale = pix_scale,
+                image = replace_mask_with_noise(image, this_source_mask_adjusted, sigma_factor=5, scale = pix_scale,
                                                 edge_smoothing_factor = 0.5)
                 layer_noise_sample = np.random.normal(loc=background_lvl, scale=background_std,
                                                       size=np.sum(this_source_mask_adjusted))

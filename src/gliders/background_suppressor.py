@@ -180,7 +180,7 @@ def show_all_methods(image, kernel = None, normalize = True, cmap = "plasma", di
 
     See Also
     --------
-    diminish_background
+    suppress_background
     get_p_simple
     get_p_logit
     get_p_layers

@@ -6,7 +6,7 @@ from .background_suppressor import suppress_background
 from .stars import detect_and_mask_stars, star_contamination_check
 from .deblending import deblend_and_mask_sources
 from .artifacts import detect_and_clean_artifacts
-from .others import background_subtraction, mask_secondary_detections, clear_background, segmentation_map_smoothing, make_background_robust
+from .others import background_subtraction, mask_secondary_detections, clear_background, segmentation_map_smoothing, remove_low_outliers
 import traceback
 import time
 
@@ -97,7 +97,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             # Non modified images with artifacts generally have pixels with values >> background, so first we filter based on that
             if (np.max(image)/img_bkg_lvl) > config.artifact_candidate_ratio:
                 image, artifact_mask, unsafe_artifact_flag = detect_and_clean_artifacts(image, config, img_bkg_lvl,
-                                                                                        pix_scale = pix_scale, main_source_pos=source_pos,
+                                                                                        pix_scale = pix_scale, main_source_pos = source_pos,
                                                                                         skip_flagged_artifacts = skip_flagged_artifacts,
                                                                                         verbose = verbose, show_plots=show_plots)
                 cleaning_mask = artifact_mask | cleaning_mask
@@ -168,9 +168,8 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         if mask_sec_objects:
             if verbose:
                 print("Removing secondary objects...")
-            main_source_mask = main_source_segment.make_source_mask()
-            image, secondary_objects_mask = mask_secondary_detections(image, image_convolved, main_source_mask,
-                                                                      config.galaxy_detection_threshold, pix_scale)
+            image, secondary_objects_mask = mask_secondary_detections(image, seg_map=seg_map, source_pos=source_pos,
+                                                                      pix_scale=1, verbose=verbose)
             cleaning_mask = secondary_objects_mask | cleaning_mask
             # update_detections() not necessary from here on.
 
@@ -187,7 +186,7 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             image, cleaning_mask = clear_background(image, main_source_mask, pix_scale)
 
         if robust_background & ~clear_all_but_segment:
-            image = make_background_robust(image)
+            image = remove_low_outliers(image)
 
         source_npixels_final = np.sum(main_source_mask)
         if source_npixels_final < source_min_pix:

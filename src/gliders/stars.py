@@ -35,7 +35,7 @@ def detect_and_mask_stars(image, main_source_mask, main_source_pos, phot_sources
         for ap_key in all_star_apertures_split["outer"]:
             ap_key.r += np.ceil(ap_key.r/2)
         outer_stars_mask = grow_mask(elliptical_aperture_masking(image, all_star_apertures_split["outer"]),1)
-        image = replace_mask_with_noise(image, outer_stars_mask, noise_factor=3, use_median=True, scale=pix_scale)
+        image = replace_mask_with_noise(image, outer_stars_mask, sigma_factor=3, use_median=True, scale=pix_scale)
         replaced_mask = replaced_mask | outer_stars_mask
 
     # Interpolating/masking over the stars that overlap partially with the galaxy
@@ -298,7 +298,7 @@ def mask_edge_stars(image,main_source_mask,all_star_apertures, config, pix_scale
         overlapping_portion = estimate_overlapping_portion(label_map, ed_main_lbl, lbl_count)
         # print("overlapping_portion", overlapping_portion)
         if overlapping_portion < config.overlap_portion_threshold:
-            image = replace_mask_with_noise(image, ed_mask, n_pixels=round(ed_ap.r / 2), noise_factor=5,
+            image = replace_mask_with_noise(image, ed_mask, n_pixels=round(ed_ap.r / 2), sigma_factor=5,
                                             scale=pix_scale,
                                             use_median=False, edge_smoothing_factor=0.4)
             edge_replaced_mask = edge_replaced_mask | ed_mask
@@ -307,7 +307,7 @@ def mask_edge_stars(image,main_source_mask,all_star_apertures, config, pix_scale
             target_pix_number = np.sum(ed_mask)
             mask_radius = round(np.sqrt(target_pix_number) / 2)
             influence_radius = mask_radius * overlapping_portion * 2
-            image = replace_mask_with_noise(image, ed_mask, noise_factor=5, scale=pix_scale)
+            image = replace_mask_with_noise(image, ed_mask, sigma_factor=5, scale=pix_scale)
             layer_noise_sample = np.random.normal(loc=background, scale=background_std,
                                                   size=np.sum(ed_mask))
             image = contour_interpolation(ed_mask, image, connectivity=8,

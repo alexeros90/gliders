@@ -58,6 +58,7 @@ def check_edge_contact(mask):
     ])
     return np.any(edges)
 
+# TODO: Simplify get_main_source_label (try to avoid the use of "table") and update everywhere after?
 def get_main_source_label(seg_map, source_pos=(0, 0), table = []):
     # We make sure positions in image are integers
     source_pos = tuple(map(round, source_pos))
@@ -285,7 +286,7 @@ def get_box_bounds(wcs, ref_image_shape):
 def convolve_with_psf(image_data, kernel_std=2.0):
     if kernel_std <= 0:
         return image_data
-    kernel = Gaussian2DKernel(kernel_std)  # FWHM = 3.0
+    kernel = Gaussian2DKernel(kernel_std)
     kernel.normalize()  # make sure kernel adds up to 1
     psf = kernel.array  # we only need the numpy array
     convolved_image = convolve(image_data, psf)
@@ -549,7 +550,7 @@ def smooth_blend(noise, image, mask, blend_width=10):
     blended = w * image + (1 - w) * noise
     return blended
 
-def replace_mask_with_noise(input_image, mask, noise_factor=3, base_line_factor = 0, use_median=False,
+def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor = 0, use_median=False,
                              smoothing_factor = 0.2, linear_image=True,
                              n_pixels=3, edge_smoothing_factor=0, noise_sample = None, scale = 1):
     """
@@ -561,7 +562,7 @@ def replace_mask_with_noise(input_image, mask, noise_factor=3, base_line_factor 
             Original image.
         mask : 2D bool array
             True for pixels to replace/smooth.
-        noise_factor : float
+        sigma_factor : float
             Range factor for noise sampling.
         base_line_factor : float
             Additional baseline added to background.
@@ -608,8 +609,8 @@ def replace_mask_with_noise(input_image, mask, noise_factor=3, base_line_factor 
 
         # Generate noise
         noise_sample = image_chk[
-            (image_chk >= background - background_std * noise_factor) &
-            (image_chk <= background + background_std * noise_factor)
+            (image_chk >= background - background_std * sigma_factor) &
+            (image_chk <= background + background_std * sigma_factor)
             ]
 
     # Fill mask pixels with noise
