@@ -1,16 +1,17 @@
 import numpy as np
 from astropy.table import Table, vstack
 from photutils.segmentation import SourceCatalog, detect_threshold, detect_sources
-from .utils import convolve_with_psf, sigma_clipping, get_main_source_label, check_edge_contact
+from .utils import convolve_with_gaussian_kernel, sigma_clipping, get_main_source_label, check_edge_contact, remove_low_outliers
 from .background_suppressor import suppress_background
 from .stars import detect_and_mask_stars, star_contamination_check
 from .deblending import deblend_and_mask_sources
 from .artifacts import detect_and_clean_artifacts
-from .others import background_subtraction, mask_secondary_detections, clear_background, segmentation_map_smoothing, remove_low_outliers
+from .others import flatten_background, mask_secondary_detections, clear_background, segmentation_map_smoothing
 import traceback
 import time
 
-# TODO: Artifact, deblending and background suppressor are ready. Need to check: stars, utils, configs, others and pipeline!
+# TODO: Artifact, deblending, background suppressor and OTHERS are ready.
+#  Need to check: stars, utils, configs and pipeline (and remove timers)!
 
 def update_sources(sources_table, artifact_mask):
     if (artifact_mask == True).any():
@@ -32,7 +33,7 @@ def update_detections(image, config = None, source_min_pix = 1, source_pos = Non
         source_pos = np.array((int(nx / 2), int(ny / 2)))
 
     if use_filter:
-        image_for_detection = convolve_with_psf(image, kernel_std=config.psf_std)
+        image_for_detection = convolve_with_gaussian_kernel(image, kernel_std=config.psf_std)
     else:
         image_for_detection = image
 
@@ -41,9 +42,7 @@ def update_detections(image, config = None, source_min_pix = 1, source_pos = Non
     if not seg_map:
         raise Exception("No sources were detected in the image.")
 
-    source_cat = SourceCatalog(image, seg_map)
-    sources_table = source_cat.to_table()
-    main_label = get_main_source_label(seg_map, source_pos = source_pos, table = sources_table)
+    main_label = get_main_source_label(seg_map, source_pos = source_pos)
     main_source_segmap = seg_map.copy()
     main_source_segmap.keep_label(label=main_label)
     return image_for_detection, seg_map, main_source_segmap
@@ -106,11 +105,11 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
 
 
         if subtract_background:
-            image = background_subtraction(image, show_plots=False, normalize=False, detection_threshold=3, psf_kernel_std = config.psf_std)
-            # times["background_subtraction"] = time.perf_counter()
-
+            image = flatten_background(image, src_detection_thresh = config.galaxy_detection_threshold,
+                                       src_min_pixels = source_min_pix, show_plots=False)
+            # times["flatten_background"] = time.perf_counter()
         if reduce_noise_level:
-            image = suppress_background(image, method ="logit", kernel_type = 16, kernel_center_weight = 3.0, smooth_noise_curve = False)
+            image = suppress_background(image, method ="logit", kernel = None, logit_alpha = 1.0)
             # smooth_noise_curve must be False, otherwise sep deblending may not work correctly
 
         # times["psf_convolution"] = time.perf_counter()

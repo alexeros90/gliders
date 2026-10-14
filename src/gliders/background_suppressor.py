@@ -48,6 +48,11 @@ def suppress_background(image, method ="simple", kernel = None, logit_alpha = 1.
         Background-suppressed image rescaled to approximately match the
         original image intensity range.
 
+    Notes
+    -----
+    For better performance it is recommended that the image background
+    is already flattened (background subtraction).
+
     See Also
     --------
     get_p_simple

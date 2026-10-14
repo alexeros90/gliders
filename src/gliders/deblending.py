@@ -4,7 +4,7 @@ from scipy.ndimage import generate_binary_structure, binary_dilation
 import sep
 import warnings
 from .utils import (get_main_source_label, separate_segments, get_image_centroid, sigma_clipping, grow_mask,
-                    replace_mask_with_noise, interpolate_image, add_noise_to_region, estimate_overlapping_portion,
+                    replace_mask_with_noise, interpolate_image, add_noise_to_region, _estimate_overlapping_portion,
                     contour_interpolation, smooth_region_edge, get_z_sources_in_image)
 
 
@@ -171,8 +171,7 @@ def deblend_and_mask_sources(image, image_filtered = None, seg_map = None, sourc
         ny, nx = image.shape
         source_pos = (nx // 2, ny // 2)
 
-    src_cat = SourceCatalog(image, seg_map)
-    main_src_label = get_main_source_label(seg_map, source_pos=source_pos, table=src_cat.to_table())
+    main_src_label = get_main_source_label(seg_map, source_pos=source_pos)
     main_source_npixels = seg_map.get_area(main_src_label)
 
     # Determining the minimum number of pixels for de-blending
@@ -190,8 +189,7 @@ def deblend_and_mask_sources(image, image_filtered = None, seg_map = None, sourc
 
     elif len(seg_map_deblend.labels) > 1:
         # Segments may vary after deblending, so main source label has to be obtained again
-        deb_cat = SourceCatalog(image, seg_map_deblend)
-        main_label = get_main_source_label(seg_map_deblend, source_pos=source_pos, table=deb_cat.to_table())
+        main_label = get_main_source_label(seg_map_deblend, source_pos=source_pos)
 
         if use_redshift and query_z_sources:
             if wcs is None:
@@ -554,7 +552,7 @@ def remove_deblended_objects(image, seg_map, main_label, overlap_portion_thresho
             image = add_noise_to_region(image, this_source_mask, noise_center = 0, noise_std = background_std,
                                         scale=pix_scale)
         else:
-            overlapping_portion = estimate_overlapping_portion(seg_map.data, main_label, this_source_label)
+            overlapping_portion = _estimate_overlapping_portion(seg_map.data, main_label, this_source_label)
             if overlapping_portion < overlap_portion_threshold:
                 image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, sigma_factor=5,
                                                 scale = pix_scale, edge_smoothing_factor = 0)

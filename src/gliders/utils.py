@@ -13,69 +13,16 @@ from astropy.coordinates import SkyCoord
 from astropy.table import Table
 import time
 
-def smooth_region_edge(image, region_mask, bordering_mask = None, layers = 5, background = 0, background_std = 0,
-                       pix_scale = 1, linear_weights = False):
-    if bordering_mask is None:
-        bordering_mask = ~region_mask
-    contact_region = grow_mask(region_mask, 1) & bordering_mask
-    current_layer = contact_region.copy()
-    previous_layer = region_mask.copy()
-    if linear_weights:
-        weights = np.linspace(1, 0, layers)
-    else:
-        weights = np.geomspace(1, 0.05, layers)
-    for layer_index in range(layers):
-        layer_indices = np.argwhere(current_layer)
-        for i, j in layer_indices:
-            i0, i1 = max(i - 1, 0), min(i + 2, image.shape[0])
-            j0, j1 = max(j - 1, 0), min(j + 2, image.shape[1])
-            previous_layer_mask = previous_layer[i0:i1, j0:j1]
-            neighborhood = image[i0:i1, j0:j1]
-            neighbor_vals = neighborhood[previous_layer_mask]
-            neighbor_mean = np.mean(neighbor_vals)
-            image[i, j] = image[i, j] * weights[layer_index] + neighbor_mean * (1 - weights[layer_index])
-        previous_layer = current_layer | previous_layer
-        current_layer = grow_mask(current_layer, 1)
 
-    image = add_noise_to_region(image, previous_layer & ~region_mask, noise_center=background,
-                                noise_std=background_std, scale=pix_scale)
-
-    return image
-
-def get_aspect_ratio(mask):
+def _get_aspect_ratio(mask):
     from skimage.measure import regionprops
     props = regionprops(mask.astype(int))[0]
     length = props.major_axis_length
     width = props.minor_axis_length
     return width/length
 
-def check_edge_contact(mask):
-    edges = np.concatenate([
-        mask[0, :],
-        mask[-1, :],
-        mask[1:-1, 0],
-        mask[1:-1, -1]
-    ])
-    return np.any(edges)
 
-# TODO: Simplify get_main_source_label (try to avoid the use of "table") and update everywhere after?
-def get_main_source_label(seg_map, source_pos=(0, 0), table = []):
-    # We make sure positions in image are integers
-    source_pos = tuple(map(round, source_pos))
-
-    main_label = seg_map.data[source_pos[1],source_pos[0]]
-    if main_label > 0:
-        return main_label
-    else:
-        closest_dist = np.sqrt(pow(seg_map.shape[0], 2) + pow(seg_map.shape[1], 2))
-        for src in table:
-            this_dist = np.sqrt(pow(source_pos[0] - src['x_centroid'], 2) + pow(source_pos[1] - src['y_centroid'], 2))
-            if this_dist < closest_dist:
-                main_label = src['label']
-                closest_dist = this_dist
-        return main_label
-
-def contour_contact_endpoints(contour, label_image, target_value, connectivity=4, return_indices=False):
+def _contour_contact_endpoints(contour, label_image, target_value, connectivity=4, return_indices=False):
     """
     Given a traced contour (list of (row, col)), find the first and last points
     along the contour that touch a pixel with `target_value`.
@@ -125,7 +72,7 @@ def contour_contact_endpoints(contour, label_image, target_value, connectivity=4
     else:
         return first_point, last_point
 
-def sort_contour_coordinates(mask, connectivity=4):
+def _sort_contour_coordinates(mask, connectivity=4):
     """
     Trace the contour of a binary mask in order (Moore-Neighbor tracing).
     Returns a list of (row, col) coordinates in walking order.
@@ -173,8 +120,10 @@ def sort_contour_coordinates(mask, connectivity=4):
 
     return contour
 
-def shift_contour_to_starting_point(contour_pixels, starting_point):
-    # Shift the list to start from the starting_point
+def _shift_contour_to_starting_point(contour_pixels, starting_point):
+    """
+    Shift the contour list so that it starts from the specified starting point.
+    """
     try:
         start_idx = contour_pixels.index(starting_point)
     except ValueError:
@@ -192,21 +141,10 @@ def shift_contour_to_starting_point(contour_pixels, starting_point):
 
     return cleaned
 
-def estimate_overlapping_portion(segmap, main_label, target_label):
-    main_region_mask = segmap == main_label
-    contour_pixels = sort_contour_coordinates(main_region_mask)
-    starting_point = get_starting_point(contour_pixels, segmap, target_label)
-    contour_pixels = shift_contour_to_starting_point(contour_pixels, starting_point)
-    endpoints = contour_contact_endpoints(contour_pixels,segmap,target_label, 4, return_indices=True)
-    if isinstance(endpoints[2], type(None)) or isinstance(endpoints[3], type(None)):
-        return 0
-    overlapping_pixels = count_target_in_closed_segment(contour_pixels, segmap, target_label, endpoints[2], endpoints[3])
-    target_pixels = np.sum(segmap == target_label)
-    # print(overlapping_pixels)
-    # print(target_pixels)
-    return overlapping_pixels/target_pixels
-
-def get_starting_point(contour_pixels, labels, target_value, connectivity=8):
+def _get_starting_point(contour_pixels, labels, target_value, connectivity=8):
+    """
+    Find a starting point on the contour that is adjacent to the target_value region.
+    """
     if connectivity == 4:
         directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
     elif connectivity == 8:
@@ -227,7 +165,7 @@ def get_starting_point(contour_pixels, labels, target_value, connectivity=8):
 
     return contour_pixels[0]  # fallback if no good candidate found
 
-def count_target_in_closed_segment(contour, label_image, target_value, first_idx, last_idx):
+def _count_target_in_closed_segment(contour, label_image, target_value, first_idx, last_idx):
     """
     Count pixels with value == target_value that are enclosed by:
     - contour[first_idx:last_idx+1]
@@ -273,8 +211,29 @@ def count_target_in_closed_segment(contour, label_image, target_value, first_idx
     mask = (label_image[rr, cc] == target_value)
     return int(np.sum(mask))
 
-def get_box_bounds(wcs, ref_image_shape):
-    nx, ny = ref_image_shape
+def _estimate_overlapping_portion(label_map, main_label, target_label):
+    """
+    Estimate the fraction of the target_label region that overlaps with the main_label region.
+    """
+    main_region_mask = label_map == main_label
+    contour_pixels = _sort_contour_coordinates(main_region_mask)
+    starting_point = _get_starting_point(contour_pixels, label_map, target_label)
+    contour_pixels = _shift_contour_to_starting_point(contour_pixels, starting_point)
+    endpoints = _contour_contact_endpoints(contour_pixels,label_map,target_label, 4, return_indices=True)
+    if isinstance(endpoints[2], type(None)) or isinstance(endpoints[3], type(None)):
+        return 0
+    overlapping_pixels = _count_target_in_closed_segment(contour_pixels, label_map, target_label, endpoints[2], endpoints[3])
+    target_pixels = np.sum(label_map == target_label)
+    # print(overlapping_pixels)
+    # print(target_pixels)
+    return overlapping_pixels/target_pixels
+
+def _get_box_bounds(wcs, image):
+    """
+    Get the RA and Dec bounds of an image given its WCS.
+    """
+
+    nx, ny = image.shape
     corners = np.array([[0, 0], [0, ny], [nx, 0], [nx, ny]])
     sky = wcs.all_pix2world(corners, 0)
     ra = sky[:, 0]
@@ -282,15 +241,6 @@ def get_box_bounds(wcs, ref_image_shape):
     ramin, ramax = ra.min(), ra.max()
     decmin, decmax = dec.min(), dec.max()
     return ((ramin, ramax), (decmin, decmax))
-
-def convolve_with_psf(image_data, kernel_std=2.0):
-    if kernel_std <= 0:
-        return image_data
-    kernel = Gaussian2DKernel(kernel_std)
-    kernel.normalize()  # make sure kernel adds up to 1
-    psf = kernel.array  # we only need the numpy array
-    convolved_image = convolve(image_data, psf)
-    return convolved_image
 
 def _merge_touching_regions(regions_map, main_label, seg_label, connectivity=8):
     """
@@ -339,6 +289,157 @@ def _merge_touching_regions(regions_map, main_label, seg_label, connectivity=8):
 
     return new_regions_map
 
+def convolve_with_gaussian_kernel(image, kernel_std=2.0):
+    """
+    Convolve the input image with a Gaussian kernel of specified standard deviation.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        The input image to be convolved.
+    kernel_std : float, optional
+        Standard deviation of the Gaussian kernel. Default is 2.0.
+
+    Returns
+    -------
+    np.ndarray
+        The convolved image.
+    """
+    if kernel_std <= 0:
+        return image
+    kernel = Gaussian2DKernel(kernel_std)
+    kernel.normalize()  # make sure kernel adds up to 1
+    kernel_img = kernel.array  # we only need the numpy array
+    convolved_image = convolve(image, kernel_img)
+    return convolved_image
+
+
+def smooth_region_edge(image, region_mask, bordering_mask=None, layers=5, background=0, background_std=0,
+                       pix_scale=1, linear_weights=False):
+    """
+    Smooth the edge of a region in an image by blending it with neighboring pixels.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        The input image to be smoothed.
+    region_mask : np.ndarray
+        A boolean mask indicating the region to be smoothed.
+    bordering_mask : np.ndarray, optional
+        A boolean mask indicating the bordering region to consider for smoothing.
+        If None, the complement of `region_mask` is used.
+    layers : int, optional
+        The number of layers to smooth outward from the region edge. Default is 5.
+    background : float, optional
+        The mean value of the background noise to be added to the smoothed region. Default is 0.
+    background_std : float, optional
+        The standard deviation of the background noise to be added to the smoothed region. Default is 0.
+    pix_scale : float, optional
+        The pixel scale to be used for noise addition. Default is 1.
+    linear_weights : bool, optional
+        If True, use linear weights for blending; if False, use geometric weights. Default is False.
+
+    Returns
+    -------
+    np.ndarray
+        The smoothed image with the region edge blended with neighboring pixels.
+    """
+
+    if bordering_mask is None:
+        bordering_mask = ~region_mask
+    contact_region = grow_mask(region_mask, 1) & bordering_mask
+    current_layer = contact_region.copy()
+    previous_layer = region_mask.copy()
+    if linear_weights:
+        weights = np.linspace(1, 0, layers)
+    else:
+        weights = np.geomspace(1, 0.05, layers)
+    for layer_index in range(layers):
+        layer_indices = np.argwhere(current_layer)
+        for i, j in layer_indices:
+            i0, i1 = max(i - 1, 0), min(i + 2, image.shape[0])
+            j0, j1 = max(j - 1, 0), min(j + 2, image.shape[1])
+            previous_layer_mask = previous_layer[i0:i1, j0:j1]
+            neighborhood = image[i0:i1, j0:j1]
+            neighbor_vals = neighborhood[previous_layer_mask]
+            neighbor_mean = np.mean(neighbor_vals)
+            image[i, j] = image[i, j] * weights[layer_index] + neighbor_mean * (1 - weights[layer_index])
+        previous_layer = current_layer | previous_layer
+        current_layer = grow_mask(current_layer, 1)
+
+    image = add_noise_to_region(image, previous_layer & ~region_mask, noise_center=background,
+                                noise_std=background_std, scale=pix_scale)
+
+    return image
+
+def check_edge_contact(mask):
+    """
+    Check if a binary mask touches the edge of the image.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        A 2D binary mask (boolean or 0/1) to check for edge contact.
+
+    Returns
+    -------
+    bool
+        True if the mask touches the edge of the image, False otherwise.
+    """
+    edges = np.concatenate([
+        mask[0, :],
+        mask[-1, :],
+        mask[1:-1, 0],
+        mask[1:-1, -1]
+    ])
+    return np.any(edges)
+
+def get_main_source_label(seg_map, source_pos, use_closest_centroid=True):
+    """
+    Return the label at source_pos, or the closest segment's label.
+
+    Parameters
+    ----------
+    seg_map : object
+        Segmentation map with `data`, `shape`, and `segments` attributes.
+    source_pos : tuple[float, float]
+        Source position as (x, y).
+    use_closest_centroid : bool, default=True
+        If the source position has no positive label, return the label of
+        the segment with the closest centroid. Otherwise, return None.
+
+    Returns
+    -------
+    int or None
+        The selected segment label, or None if no label can be determined.
+    """
+    x, y = map(round, source_pos)
+    main_label = seg_map.data[y, x]
+    if main_label > 0:
+        return main_label
+    if not use_closest_centroid:
+        return None
+    else:
+        closest_dist_sq = np.sqrt(pow(seg_map.shape[0], 2) + pow(seg_map.shape[1], 2))
+        for segment in seg_map.segments:
+            segment_mask = segment.data_masked
+            total = segment_mask.sum()
+            if total == 0:
+                continue
+
+            y_coords, x_coords = np.indices(segment_mask.shape)
+            x_seg_centroid = (x_coords * segment_mask).sum() / total
+            y_seg_centroid = (y_coords * segment_mask).sum() / total
+            centroid_x = round(segment.bbox.ixmin + x_seg_centroid)
+            centroid_y = round(segment.bbox.iymin + y_seg_centroid)
+
+            dist_sq = ((x - centroid_x) ** 2 + (y - centroid_y) ** 2)
+            if dist_sq < closest_dist_sq:
+                closest_dist_sq = dist_sq
+                main_label = segment.label
+
+        return main_label
+
 def grow_mask(input_mask: np.ndarray, pixels: int) -> np.ndarray:
     """
     Expands the `True` regions of a 2D boolean mask by a given number of pixels.
@@ -384,21 +485,51 @@ def shrink_mask(input_mask: np.ndarray, pixels: int) -> np.ndarray:
     shrunk_mask = binary_erosion(input_mask, structure=structure)
     return shrunk_mask
 
-def normalize_data(data, robust = False):
-    # Input must be a numpy array
+def normalize_data(data, percentiles=(0, 100), robust=False):
+    """Normalize data to [0, 1], preserving NaNs."""
+    data = np.asarray(data, dtype=float)
+
+    if data.size == 0:
+        raise ValueError("data must not be empty")
+
     if robust:
-        data_min = np.percentile(data, 1)
-        data_max = np.percentile(data, 99)
+        p_min, p_max = percentiles
+        if not (0 <= p_min <= p_max <= 100):
+            raise ValueError("percentiles must satisfy 0 <= p_min <= p_max <= 100")
+
+        data_min = np.nanpercentile(data, p_min)
+        data_max = np.nanpercentile(data, p_max)
     else:
         data_min = np.nanmin(data)
         data_max = np.nanmax(data)
 
+    if not np.isfinite(data_min) or not np.isfinite(data_max):
+        raise ValueError("data must contain at least one finite value")
+
     if data_max == data_min:
-        data_max = data_min + 1e-6
-    data = (data - data_min) / (data_max - data_min)
-    return np.clip(data, 0, 1)
+        return np.zeros_like(data)
+
+    normalized = (data - data_min) / (data_max - data_min)
+    return np.clip(normalized, 0, 1)
 
 def get_profile(image, center_pos = None, radius = 1):
+    """
+    Get the mean pixel value in concentric layers around a center position.
+
+    Parameters
+    ----------
+    image : 2D array
+        Input image.
+    center_pos : tuple of int, optional
+        Center position (row, col) for the profile. If None, defaults to the image center.
+    radius : int
+        Number of layers to compute the profile.
+
+    Returns
+    -------
+    profile : list of float
+        Mean pixel values for each layer.
+    """
     if center_pos is None:
         center_pos = image.shape[0] // 2, image.shape[1] // 2
     current_mask = np.zeros_like(image, dtype=bool)
@@ -415,6 +546,24 @@ def get_profile(image, center_pos = None, radius = 1):
     return profile
 
 def get_profile_from_border(image, mask=None, n_layers=1):
+    """
+    Get the mean pixel value in concentric layers around a mask.
+
+    Parameters
+    ----------
+    image : 2D array
+        Input image.
+    mask : 2D boolean array, optional
+        Binary mask indicating the region of interest. If None, a single pixel at the center of the image is used.
+    n_layers : int
+        Number of layers to compute the profile. Must be >= 0.
+
+    Returns
+    -------
+    profile : list of float
+        Mean pixel values for each layer, starting from the first layer outside the mask.
+    """
+
     if n_layers < 0:
         raise ValueError("n_layers must be >= 0")
 
@@ -447,14 +596,40 @@ def get_profile_from_border(image, mask=None, n_layers=1):
     return profile
 
 def get_profile_gradient(profile):
+    """
+    Compute the first and second derivatives of a profile.
+    """
     # This function assumes the x values increase by 1.
     profile = np.asarray(profile)
     slopes = np.diff(profile)
     slope_deltas = np.diff(slopes, prepend=0)
     return slopes, slope_deltas
 
-def add_noise_to_region(image, mask, noise_sample = None, noise_center = None, noise_std = None, scale = 1):
-    if not isinstance(noise_sample, type(None)):
+def add_noise_to_region(image, mask, noise_sample = None, noise_center = None, noise_std = None, pix_scale = 1):
+    """
+    Add noise to a specified region of an image.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        The input image to which noise will be added.
+    mask : np.ndarray
+        A boolean mask indicating the region where noise should be added.
+    noise_sample : np.ndarray, optional
+        An array of noise values to sample from. If provided, noise will be sampled from this array.
+    noise_center : float, optional
+        The mean value of the noise distribution. Required if `noise_sample` is not provided.
+    noise_std : float, optional
+        The standard deviation of the noise distribution. Required if `noise_sample` is not provided.
+    pix_scale : float, optional
+        A scaling factor for the noise. Default is 1 (no scaling).
+
+    Returns
+    -------
+    np.ndarray
+        The image with noise added to the specified region.
+    """
+    if noise_sample is not None:
         noise_center = np.mean(noise_sample)
         noise_img = np.random.choice(noise_sample, size=(image.shape[0], image.shape[1]))
     elif noise_center is None or noise_std is None:
@@ -462,15 +637,15 @@ def add_noise_to_region(image, mask, noise_sample = None, noise_center = None, n
     else:
         noise_img = np.random.normal(loc=noise_center, scale=noise_std, size=(image.shape[0], image.shape[1]))
 
-    if scale > 1:
-        noise_img = rescale_image(noise_img, scale)
+    if pix_scale > 1:
+        noise_img = rescale_image(noise_img, pix_scale)
 
     image[mask] = image[mask] + noise_img[mask] - noise_center
     return image
 
 def rescale_image(image, scale=1.0):
     """
-    Will downgrade an image resolution by scale. Recommended mostly for noise.
+    Will downgrade an image resolution by scale. Recommended mostly for adding noise.
 
     Parameters
     ----------
@@ -520,7 +695,6 @@ def rescale_image(image, scale=1.0):
     return new_image
 
 def smooth_blend(noise, image, mask, blend_width=10):
-    from scipy.ndimage import distance_transform_edt
     """
     Blend image into noise smoothly inside mask.
 
@@ -535,8 +709,8 @@ def smooth_blend(noise, image, mask, blend_width=10):
     blend_width : int
         Width (in pixels) of the transition zone.
     """
-    # Distance inside mask (to nearest edge)
-    dist_in = distance_transform_edt(mask)
+
+    from scipy.ndimage import distance_transform_edt
     # Distance outside mask (to nearest edge)
     dist_out = distance_transform_edt(~mask)
 
@@ -551,8 +725,8 @@ def smooth_blend(noise, image, mask, blend_width=10):
     return blended
 
 def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor = 0, use_median=False,
-                             smoothing_factor = 0.2, linear_image=True,
-                             n_pixels=3, edge_smoothing_factor=0, noise_sample = None, scale = 1):
+                            smoothing_factor = 0.2, linear_image=True, n_pixels=3, edge_smoothing_factor=0,
+                            noise_sample = None, pix_scale = 1):
     """
         Replace pixels inside a mask with noise and optionally smooth them with neighbor pixels.
 
@@ -578,8 +752,10 @@ def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor 
             Weight for edge pixels blending.
         noise_sample : array or None
             Precomputed noise values. If None, sampled automatically.
-        scale : float
-            Factor for scaling neighbor contribution. scale is used to get the scaling_factor, which is the same as smoothing factor but with the purpose of making the image look as if it had lower resolution. scale = 1 does nothing on the image
+        pix_scale : float
+            Factor for scaling neighbor contribution. pix_scale is used to get the scaling_factor,
+            which is the same as smoothing factor but with the purpose of making the image look as if it
+            had lower resolution. pix_scale = 1 does nothing on the image
 
         Returns
         -------
@@ -587,10 +763,10 @@ def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor 
             Modified image.
         """
 
-    if scale < 1:
+    if pix_scale < 1:
         print("Scale cannot be less than 1. Forcing scale to 1")
-        scale = 1
-    scaling_factor = 2 * (scale - 1) / np.power(scale, 2)
+        pix_scale = 1
+    scaling_factor = 2 * (pix_scale - 1) / np.power(pix_scale, 2)
     smoothing_factor = np.clip(smoothing_factor, 0, 1)
     edge_smoothing_factor = np.clip(edge_smoothing_factor, 0, 1)
     n_pixels = max(n_pixels, 0)
@@ -652,12 +828,12 @@ def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor 
         # Final update
         new_img = image.copy()
         valid = mask.copy()
-        scaling_factor_diag = scaling_factor * (scale - 1) / 2.0
+        scaling_factor_diag = scaling_factor * (pix_scale - 1) / 2.0
         scaling_factor_total = scaling_factor + scaling_factor_diag
         new_img[valid] = (
                 (1 - scaling_factor_total) * (1 - smoothing_factor) * image[valid]
                 + scaling_factor * sum_orth[valid]
-                + (scaling_factor * (scale - 1) / 2.0) * sum_diag[valid]
+                + (scaling_factor * (pix_scale - 1) / 2.0) * sum_diag[valid]
                 + smoothing_factor * mean_all[valid]
         )
         image = new_img
@@ -696,6 +872,7 @@ def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor 
 
     return image
 
+# TODO: documentation from here
 def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration_limit=50, use_median=False,
                    use_iqr = False, robust=False, direction = "symmetric"):
     # Will return mean and standard deviation or median and iqr depending on use_median
@@ -768,6 +945,13 @@ def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration
         iter_count += 1
 
     return central_measure, sigma
+
+def remove_low_outliers(image, sigma=5):
+    bkg_lvl, bkg_std = sigma_clipping(image)
+    outlier_mask = image < bkg_lvl - sigma * bkg_std
+    image[outlier_mask] = np.random.normal(loc=bkg_lvl, scale=bkg_std, size=np.sum(outlier_mask))
+    return image
+
 
 def linear_kernel(type=8, center_weight=2.0):
     if type == 8:
@@ -950,7 +1134,7 @@ def separate_segments(labels, omit_background=True):
 
 def get_z_sources_in_image(image, wcs, z_query_timeout, z_query_synch, z_query_attempts=2):
     from .z_queries.z_fetcher import query_nearby_z_sources
-    image_bounds_coords = get_box_bounds(wcs, image.shape)
+    image_bounds_coords = _get_box_bounds(wcs, image)
     z_sources_from_query_df, failed_z_query = query_nearby_z_sources(image_bounds_coords,
                                                                   timeout=z_query_timeout,
                                                                   synchronous=z_query_synch, attempts=z_query_attempts)

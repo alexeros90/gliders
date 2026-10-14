@@ -1,13 +1,13 @@
 import numpy as np
-from photutils.detection import DAOStarFinder, IRAFStarFinder
+from photutils.detection import DAOStarFinder, IRAFStarFinder, StarFinder
 from photutils.segmentation import detect_threshold
 from astropy.nddata import Cutout2D
 from astropy.table import vstack
+from astropy.convolution import Gaussian2DKernel
 from photutils.aperture import CircularAperture
-import time
 from .star_filter import star_detection_filtering
-from .utils import interpolate_image, add_noise_to_region, contour_interpolation, replace_mask_with_noise, grow_mask, convolve_with_psf, has_false_neighbor, sigma_clipping, estimate_overlapping_portion
-
+from .utils import interpolate_image, add_noise_to_region, contour_interpolation, replace_mask_with_noise, grow_mask, convolve_with_gaussian_kernel, has_false_neighbor, sigma_clipping, _estimate_overlapping_portion
+import warnings
 
 def detect_and_mask_stars(image, main_source_mask, main_source_pos, phot_sources, config, image_psf, pix_scale = 1,
                           return_image_only = False, show_plots = False):
@@ -53,66 +53,63 @@ def detect_and_mask_stars(image, main_source_mask, main_source_pos, phot_sources
     else:
         return image, replaced_mask, all_star_apertures_split
 
-def find_all_star_apertures(image, main_source_pos, phot_sources, safe_star_masking_radius,config, use_phot_sources = True, use_finders = False, clear_nucleus = True, image_psf = None):
+def find_all_star_apertures(image, main_source_pos, phot_sources, safe_star_masking_radius,config,
+                            use_phot_sources = True, use_finders = False, clear_nucleus = True, image_psf = None,
+                            verbose = False):
     if not use_phot_sources and not use_finders:
-        print("Both the finders and photometric sources are turned off, so no stars will be detected.")
+        if verbose:
+            warnings.warn("Both the finders and photometric sources are turned off, so no stars will be detected.",
+                          UserWarning, stacklevel=2)
         return None
 
     all_stars_detected_list = []
 
-    times = {}
-    times["start"] = time.perf_counter()
     if phot_sources is not None and use_phot_sources:
         # We use the detections from the input use_phot_sources table
         stars_from_phot_sources = phot_sources[phot_sources['type']=='PSF']
         all_stars_detected_list.append(stars_from_phot_sources)
 
     if use_finders:
-        # We detect stars in the image
-        fwhm_span = config.star_fwhm_span
+        # Detecting stars in the image
         convolved_image = image
         for this_std in config.star_psf_stds:
-            t_conv_i = time.perf_counter()
             if this_std > 0:
-                # Instead of convolving the original image with a psf with this_std we use the previous convoluted image and convolve it with effective_std, which is equivalent but results in half processing time.
+                # Instead of convolving the original image with a psf with this_std we use the previous convoluted
+                # image and convolve it with effective_std, which is equivalent but results in roughly half
+                # the processing time.
                 effective_std = np.sqrt(this_std*this_std-np.power(this_std-1,2))
-                convolved_image = convolve_with_psf(convolved_image, effective_std)
+                convolved_image = convolve_with_gaussian_kernel(convolved_image, effective_std)
 
-            main_fwhm = 8.6 + 3.5 * this_std
-            t_conv_f = time.perf_counter()
+            det_fwhm = -0.31 + 12.45 * this_std # Empirically derived relation to maximize detections
 
-            for this_fwhm in [main_fwhm - fwhm_span, main_fwhm, main_fwhm + fwhm_span]:
-                # for this_fwhm in [main_fwhm]:
+            stars_detected = detect_stars_in_image(convolved_image, config.star_detection_threshold, det_fwhm,
+                                                   config.star_detector, config.star_roundness,
+                                                   config.star_sharpness_low, config.star_min_radius, config.sigma_radius)
 
-                stars_detected = detect_stars_in_image(convolved_image, config.star_detection_threshold,
-                                                       config.star_detector, this_fwhm, config.star_roundness,
-                                                       config.star_sharpness_low, config.star_min_radius, config.sigma_radius)
-                if not isinstance(stars_detected, type(None)):
-                    # Controlling that centroids are inside the image
-                    stars_detected['x_centroid'][stars_detected['x_centroid'] > image.shape[1] - 1] = image.shape[1] - 1
-                    stars_detected['x_centroid'][stars_detected['x_centroid'] < 0] = 0
-                    stars_detected['y_centroid'][stars_detected['y_centroid'] > image.shape[0] - 1] = image.shape[0] - 1
-                    stars_detected['y_centroid'][stars_detected['y_centroid'] < 0] = 0
-                    stars_detected['type'] = 'PSF'
-                    all_stars_detected_list.append(stars_detected)
-
-        t_det = time.perf_counter()
+            if stars_detected is not None:
+                # Controlling that centroids are inside the image
+                stars_detected['x_centroid'][stars_detected['x_centroid'] > image.shape[1] - 1] = image.shape[1] - 1
+                stars_detected['x_centroid'][stars_detected['x_centroid'] < 0] = 0
+                stars_detected['y_centroid'][stars_detected['y_centroid'] > image.shape[0] - 1] = image.shape[0] - 1
+                stars_detected['y_centroid'][stars_detected['y_centroid'] < 0] = 0
+                stars_detected['type'] = 'PSF'
+                all_stars_detected_list.append(stars_detected)
 
     if len(all_stars_detected_list)==0:
         return None
-    times["kernels"] = time.perf_counter()
     all_stars_detected = vstack(all_stars_detected_list, metadata_conflicts = 'silent')
     all_stars_detected['id'] = np.arange(1, len(all_stars_detected) + 1)
     all_stars_detected = remove_redundant_star_detections(all_stars_detected, config.star_min_radius)
-    times["redu"] = time.perf_counter()
+
+    # TODO: continue from here
 
     filter_psf_std = config.star_filter_psf_std
     if image_psf is not None:
-        psf_for_stars = convolve_with_psf(image_psf, filter_psf_std)
+        psf_for_stars = convolve_with_gaussian_kernel(image_psf, filter_psf_std)
     else:
         psf_for_stars = None
 
-    all_stars_detected = star_detection_filtering(image=convolve_with_psf(image, filter_psf_std), stars_detected=all_stars_detected, min_radius=config.star_min_radius,
+    all_stars_detected = star_detection_filtering(image=convolve_with_gaussian_kernel(image, filter_psf_std), stars_detected=all_stars_detected, min_radius=config.star_min_radius,
                                                   max_radius=config.star_max_radius, slope_threshold = config.star_filter_slope_thresh,
                                                   delta_slope_threshold = config.star_filter_delta_slope_thres,
                                                   profile_cos_distance_threshold = config.star_filter_prof_cos_dist_thresh,
@@ -124,23 +121,12 @@ def find_all_star_apertures(image, main_source_pos, phot_sources, safe_star_mask
     if all_stars_detected is None:
         return None
 
-    times["plus"] = time.perf_counter()
-
     all_star_apertures = get_star_apertures(all_stars_detected)
 
     # Removing any stars that overlap with the galaxy nucleus
     if clear_nucleus:
         all_star_apertures = remove_nucleus_apertures(all_star_apertures, main_source_pos, safe_star_masking_radius)
-        times["nucs"] = time.perf_counter()
 
-    # print()
-    # print("TIMES:")
-    # print(times['kernels'] - times['start'])
-    # print(times['redu'] - times['kernels'])
-    # print(times['plus'] - times['redu'])
-    # print(times['nucs'] - times['plus'])
-    # print()
-    # quit()
     return all_star_apertures
 
 def classify_apertures(all_star_apertures, main_source_mask):
@@ -211,21 +197,26 @@ def interpolate_apertures(image_data, main_source_mask, apertures, interpolation
 
     return image_data_cp
 
-def detect_stars_in_image(image, star_detection_threshold, star_detector, star_fwhm, star_roundness,
-                          star_sharpness_low, star_min_radius, sigma_radius):
+def detect_stars_in_image(image, detection_thresh_sigma, star_fwhm, star_detector = None, star_roundness = 0.5,
+                          star_sharpness_low = 0.2, star_min_radius = None, sigma_radius = 1.5):
 
-    detection_threshold = detect_threshold(image, nsigma=star_detection_threshold)[0][0]
-
+    detection_threshold = detect_threshold(image, nsigma=detection_thresh_sigma)[0][0]
+    roundness_range = (-star_roundness,star_roundness)
+    sharpness_range = (star_sharpness_low,1.0)
     if star_detector == "dao":
-        finder = DAOStarFinder(fwhm=star_fwhm, sigma_radius=sigma_radius, threshold=detection_threshold, roundlo=-star_roundness,
-                               roundhi=star_roundness, sharplo=star_sharpness_low,
+        finder = DAOStarFinder(threshold=detection_threshold, fwhm=star_fwhm, sigma_radius=sigma_radius,
+                               roundness_range = roundness_range, sharpness_range=sharpness_range,
                                min_separation = star_min_radius)
-    else:
-        finder = IRAFStarFinder(fwhm=star_fwhm, threshold=detection_threshold, roundlo=-star_roundness,
-                                roundhi=star_roundness, sharplo=star_sharpness_low,
+    elif star_detector == "iraf":
+        finder = IRAFStarFinder(threshold=detection_threshold, fwhm=star_fwhm, sigma_radius=sigma_radius,
+                                roundness_range = roundness_range, sharpness_range=sharpness_range,
                                 min_separation = star_min_radius)
+    else:
+        star_kernel = Gaussian2DKernel(2.0)
+        finder = StarFinder(threshold=detection_threshold, kernel=star_kernel, min_separation=star_min_radius)
+
     stars_detected = finder(image)
-    if not isinstance(stars_detected, type(None)):
+    if stars_detected is not None:
         stars_detected = stars_detected['id', 'x_centroid', 'y_centroid']
     return stars_detected
 
@@ -295,7 +286,7 @@ def mask_edge_stars(image,main_source_mask,all_star_apertures, config, pix_scale
         ed_mask = ed_ap.to_mask(method='exact').to_image(label_map.shape, dtype=bool)
         ed_mask = grow_mask(ed_mask, int(np.ceil(ed_ap.r/2)))
         label_map[ed_mask] = lbl_count
-        overlapping_portion = estimate_overlapping_portion(label_map, ed_main_lbl, lbl_count)
+        overlapping_portion = _estimate_overlapping_portion(label_map, ed_main_lbl, lbl_count)
         # print("overlapping_portion", overlapping_portion)
         if overlapping_portion < config.overlap_portion_threshold:
             image = replace_mask_with_noise(image, ed_mask, n_pixels=round(ed_ap.r / 2), sigma_factor=5,
