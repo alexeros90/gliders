@@ -26,8 +26,8 @@ class Config:
     interpolation_extent: float # When interpolating, will consider a square area of 'interpolation_extent' times the star's radius
     safe_star_masking_prop_radius: float # The safe region will have a radius that corresponds to a circle with an area that is this times the number of pixels of the source
     big_contaminator_pix_ratio: float # If the star to galaxy size ratio is larger than this value, a warning is triggered and the galaxy is flagged
-    star_min_radius: float # Minimum radius fro star to be detected
-    star_max_radius: float # Maximum radius fro star to be detected
+    star_min_radius: float # Minimum radius for star to be detected
+    star_max_radius: float # Maximum radius for star to be detected
     star_filter_psf_std: float # The std for the kernel used to convolve the image with a psf to filter the detected stars
     star_filter_slope_thresh: float # threshold for the slope of the profile. When this threshold and delta_slope_threshold are met, we define the star's radius
     star_filter_delta_slope_thres: float # threshold for the change in slope of the profile. When this threshold and delta_slope_threshold are met, we define the star's radius

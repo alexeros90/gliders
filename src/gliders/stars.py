@@ -199,6 +199,34 @@ def interpolate_apertures(image_data, main_source_mask, apertures, interpolation
 
 def detect_stars_in_image(image, detection_thresh_sigma, star_fwhm, star_detector = None, star_roundness = 0.5,
                           star_sharpness_low = 0.2, star_min_radius = None, sigma_radius = 1.5):
+    """
+    Detect stars in the image using the specified star detection method and parameters.
+
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Two-dimensional input image to be processed.
+    detection_thresh_sigma: float
+        The number of standard deviations above the background to use as the detection threshold.
+    star_fwhm: float
+        The full width at half maximum of the stars to detect.
+    star_detector: str
+        The star detection method to use ('dao', 'iraf', or None for StarFinder).
+    star_roundness: float
+        The roundness parameter for the star detection algorithm.
+    star_sharpness_low: float
+        The lower bound for the sharpness parameter for the star detection algorithm.
+    star_min_radius: float
+        The minimum separation between detected stars.
+    sigma_radius: float
+        The radius in pixels for the Gaussian kernel used in the star detection algorithm.
+
+    Returns:
+    --------
+    stars_detected: astropy Table
+        Containing the detected stars with their properties (id, x_centroid, y_centroid).
+    """
+
 
     detection_threshold = detect_threshold(image, nsigma=detection_thresh_sigma)[0][0]
     roundness_range = (-star_roundness,star_roundness)
@@ -239,7 +267,23 @@ def get_star_apertures(stars_detected, default_radius = 2):
         current_id += 1
     return detected_star_apertures
 
-def remove_redundant_star_detections(all_stars_detected, min_separation):
+def remove_redundant_star_detections(all_stars_detected, min_separation = 1.0):
+    """
+    Remove redundant star detections that are too close to each other based on the specified minimum separation
+
+    Parameters:
+    -----------
+    all_stars_detected : astropy Table
+        Table containing detected stars with their properties (id, x_centroid, y_centroid).
+    min_separation : float
+        Minimum separation distance between stars to consider them as distinct detections.
+
+    Returns:
+    --------
+    astropy Table
+        Filtered table containing only distinct star detections based on the minimum separation criteria.
+    """
+
     ids_to_keep = []
     positions = np.array([[star['x_centroid'], star['y_centroid']] for star in all_stars_detected])
     ids = np.array([star['id'] for star in all_stars_detected])
@@ -318,7 +362,8 @@ def star_contamination_check(main_source_mask, all_star_apertures, safe_pix_rati
             size_ratio = np.sum(ap_mask) / main_source_px
             if size_ratio > safe_pix_ratio:
                 if verbose:
-                    print("WARNING: Detected a big star that might result in bad masking.")
+                    warnings.warn("Detected a big star that might result in bad masking.", UserWarning,
+                                  stacklevel=2)
                 return True
     return False
 

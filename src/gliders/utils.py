@@ -1,6 +1,4 @@
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import cv2
 from collections import Counter
 from scipy.ndimage import label, generate_binary_structure, binary_dilation, binary_erosion
@@ -11,8 +9,7 @@ from scipy.interpolate import LinearNDInterpolator
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 from astropy.table import Table
-import time
-
+import warnings
 
 def _get_aspect_ratio(mask):
     from skimage.measure import regionprops
@@ -20,7 +17,6 @@ def _get_aspect_ratio(mask):
     length = props.major_axis_length
     width = props.minor_axis_length
     return width/length
-
 
 def _contour_contact_endpoints(contour, label_image, target_value, connectivity=4, return_indices=False):
     """
@@ -289,6 +285,31 @@ def _merge_touching_regions(regions_map, main_label, seg_label, connectivity=8):
 
     return new_regions_map
 
+def _coords_to_pixels(sources, wcs):
+    """
+    Convert RA/Dec coordinates of sources to pixel coordinates using WCS.
+    """
+    sources['x_pos'] = -1.
+    sources['y_pos'] = -1.
+    for zsrc_id, zsrc_ra, zsrc_dec in zip(sources["object_id"], sources["ra"], sources["dec"]):
+        z_source_coords = SkyCoord(zsrc_ra * u.deg, zsrc_dec * u.deg, frame='icrs')
+        z_source_x_pix, z_source_y_pix = wcs.world_to_pixel(z_source_coords)
+        sources.loc[sources['object_id'] == zsrc_id, 'x_pos'] = z_source_x_pix
+        sources.loc[sources['object_id'] == zsrc_id, 'y_pos'] = z_source_y_pix
+    sources = sources[(sources['x_pos'] >= 0) & (sources['y_pos'] >= 0)]
+    return (sources)
+
+def _check_ra_range_leap(ra_range):
+    """
+    Check if the RA range crosses the 0/360 boundary.
+    """
+    dir_dif = abs(ra_range[1] - ra_range[0])
+    skip_dif = abs(ra_range[1] + 360 - ra_range[0])
+    if dir_dif > skip_dif and (ra_range[1]<ra_range[0]):
+        return True
+    else:
+        return False
+
 def convolve_with_gaussian_kernel(image, kernel_std=2.0):
     """
     Convolve the input image with a Gaussian kernel of specified standard deviation.
@@ -312,7 +333,6 @@ def convolve_with_gaussian_kernel(image, kernel_std=2.0):
     kernel_img = kernel.array  # we only need the numpy array
     convolved_image = convolve(image, kernel_img)
     return convolved_image
-
 
 def smooth_region_edge(image, region_mask, bordering_mask=None, layers=5, background=0, background_std=0,
                        pix_scale=1, linear_weights=False):
@@ -872,9 +892,441 @@ def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor 
 
     return image
 
-# TODO: documentation from here
+def get_image_centroid(image):
+    """
+    Calculate the centroid of a 2D image based on pixel intensities.
+    """
+    x_coords = np.linspace(0, image.shape[1] - 1, image.shape[1]).astype('int')
+    y_coords = np.linspace(0, image.shape[0] - 1, image.shape[0]).astype('int')
+    x_mean = np.mean(image, axis=0)
+    y_mean = np.mean(image, axis=1)
+    x_mean_sum = np.sum(x_mean)
+    y_mean_sum = np.sum(y_mean)
+    if x_mean_sum <= 0 or y_mean_sum <= 0:
+        return None
+    x_centroid = int(np.sum(x_mean * x_coords) / x_mean_sum)
+    y_centroid = int(np.sum(y_mean * y_coords) / y_mean_sum)
+    return (x_centroid, y_centroid)
+
+def linear_kernel(type=8, center_weight=2.0):
+    """
+    Create a linear kernel for smoothing or convolution.
+    """
+    if type == 8:
+        kernel = np.ones((3, 3))  # includes center
+    elif type == 4:
+        kernel = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+    else:
+        kernel = np.array(
+            [[0.25, 0.50, 0.75, 0.50, 0.25],
+             [0.50, 0.75, 1.00, 0.75, 0.50],
+             [0.75, 1.00, 1.00, 1.00, 0.75],
+             [0.50, 0.75, 1.00, 0.75, 0.50],
+             [0.25, 0.50, 0.75, 0.50, 0.25]])
+
+    kernel[kernel.shape[0] // 2, kernel.shape[1] // 2] = center_weight
+    return kernel
+
+def grow_pixel_circular(mask_shape, position=None, radius=1):
+    """
+    Grow a pixel in a circular region around the center.
+
+    Parameters:
+    - mask_shape: tuple, shape of the output mask (height, width)
+    - center: tuple, (row, col) coordinate of the pixel to grow
+    - radius: int, radius of the circular growth
+
+    Returns:
+    - A boolean mask of the same shape with True in the circular region
+    """
+    if position is None:
+        position = (mask_shape[0] // 2, mask_shape[1] // 2)
+    if radius <= 0:
+        raise ValueError("Radius must be a positive integer.")
+    if radius > np.max(mask_shape) / 2:
+        radius = int(np.max(mask_shape) / 2)
+
+    rows, cols = np.ogrid[:mask_shape[0], :mask_shape[1]]
+    cy, cx = position
+    dist_sq = (rows - cy) ** 2 + (cols - cx) ** 2
+    circle_mask = dist_sq <= radius ** 2
+    return circle_mask
+
+def adjust_image_resolution_to_scale(image, scale = 1):
+    """
+    Adjust the resolution of an image by a given scale factor.
+    """
+    if scale < 1.0:
+        warnings.warn("Scale cannot be less than 1. Returning unprocessed image.", UserWarning, stacklevel=2)
+        return image
+    scaling_factor = 2 * (scale - 1) / np.power(scale, 2)
+    pre_smoothing_image_mean = np.mean(image)
+    # Kernels
+    k_orth = np.array([[0, 1, 0],
+                       [1, 0, 1],
+                       [0, 1, 0]], dtype=float)
+
+    # Diagonal (corners)
+    k_diag = np.array([[1, 0, 1],
+                       [0, 0, 0],
+                       [1, 0, 1]], dtype=float)
+
+    # Sums of neighbors
+    sum_orth = sci_convolve(image, k_orth, mode='constant', cval=0.0)
+    sum_diag = sci_convolve(image, k_diag, mode='constant', cval=0.0)
+
+    # Final update
+    scaling_factor_diag = scaling_factor * (scale - 1) / 2.0
+    scaling_factor_total = scaling_factor + scaling_factor_diag
+    new_image = (
+            (1 - scaling_factor_total) * image
+            + scaling_factor * sum_orth
+            + (scaling_factor * (scale - 1) / 2.0) * sum_diag
+    )
+    image = new_image
+    # Correcting mean for artificial increase due to averaging
+    image -= (np.mean(image) - pre_smoothing_image_mean)
+    return image
+
+def has_false_neighbor(mask: np.ndarray, region_mask: np.ndarray, connect_type = 4) -> bool:
+    """
+    Returns True if any cell in region_mask has a False neighbor in mask.
+    """
+    # Create a structuring element to define 4- or 8-connected neighborhood
+    if connect_type == 8:
+        structure = np.array([[1, 1, 1],
+                              [1, 1, 1],
+                              [1, 1, 1]])
+    else:
+        structure = np.array([[0, 1, 0],
+                              [1, 1, 1],
+                              [0, 1, 0]])
+
+    # Dilate the region to get the region + its neighbors
+    dilated = binary_dilation(region_mask, structure=structure)
+
+    # Exclude original region to keep only the border/neighbor cells
+    neighbors = dilated & ~region_mask
+
+    # Now check if any of the neighbors are False in the main mask
+    return np.any(~mask & neighbors)
+
+def interpolate_image(image, mask, mask_radius=3, method="inpaint"):
+    """
+    Interpolate over masked regions in an image using either inpainting or linear interpolation.
+
+    Parameters:
+    -----------
+    image  : np.ndarray
+        The input image to be interpolated.
+    mask : np.ndarray
+        A boolean mask where True indicates the pixels to be interpolated.
+    mask_radius : int, optional
+        The radius of the neighborhood used for interpolation. Default is 3.
+    method : str, optional
+        The interpolation method to use. Options are "inpaint" (default) or "linear
+
+    Returns:
+    --------
+    np.ndarray
+        The interpolated image.
+    """
+    interpolated_img = image.copy()
+    if method == "inpaint":
+        inpaint_r = np.max((round(mask_radius / 2, 0), 2))
+        img_max = np.max(image)
+        img_min = np.min(image)
+        mask_cv = (mask.astype(np.uint8)) * 255
+        norm_img = 255 * ((image - img_min) / (img_max - img_min)).astype(np.float32)
+        inpainted = cv2.inpaint(norm_img, mask_cv, inpaintRadius=inpaint_r, flags=cv2.INPAINT_NS)
+        interp_img = inpainted / 255 * (img_max - img_min) + img_min
+        interpolated_img[mask] = interp_img[mask]
+
+    else:
+        non_masked_coords = []
+        non_masked_values = []
+        for i in range(mask.shape[0]):
+            for j in range(mask.shape[1]):
+                if mask[i, j]:
+                    continue
+                non_masked_coords.append((i, j))
+                non_masked_values.append(image[i, j])
+        interp_img = LinearNDInterpolator(non_masked_coords, non_masked_values)
+        for i in range(image.shape[0]):
+            for j in range(image.shape[1]):
+                if mask[i, j]:
+                    interpolated_img[i, j] = interp_img(i, j)
+
+    return interpolated_img
+
+def separate_segments(label_map, omit_background=True):
+    """
+    Separate connected components within each label in a label map.
+
+    Parameters
+    ----------
+    label_map : np.ndarray
+        2D array where each unique integer represents a different segment.
+    omit_background : bool, optional
+        If True, the background label (0) will not be processed. Default is True.
+
+    Returns
+    -------
+    np.ndarray
+        A new label map where connected components within each label are separated and assigned new labels.
+    """
+
+    label_map = np.array(label_map, copy=True)
+    h, w = label_map.shape
+    structure = generate_binary_structure(2, 1)  # 4-connectivity
+
+    for lbl in np.unique(label_map):
+        if lbl == -1:
+            continue  # skip special labels if desired
+        if omit_background and lbl == 0:
+            continue  # skip background if requested
+
+        # Binary mask for this label
+        mask = (label_map == lbl)
+
+        # Label connected components inside this label's mask
+        labeled, num = label(mask, structure=structure)
+
+        if num <= 1:
+            continue  # only one region, nothing to do
+
+        # Find largest component ID
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0  # background of component labeling
+        largest_id = sizes.argmax()
+
+        for comp_id in range(1, num + 1):
+            if comp_id == largest_id:
+                continue  # keep main region
+
+            # Coordinates of this small component
+            coords = np.argwhere(labeled == comp_id)
+
+            # Find neighboring labels
+            neighbor_labels = []
+            for x, y in coords:
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < h and 0 <= ny < w:
+                        if label_map[nx, ny] != lbl:
+                            neighbor_labels.append(label_map[nx, ny])
+
+            if neighbor_labels:
+                # Most common neighbor label
+                new_lbl = Counter(neighbor_labels).most_common(1)[0][0]
+                label_map[labeled == comp_id] = new_lbl
+
+    return label_map
+
+def get_z_sources_in_image(image, wcs, z_query_timeout=20, z_query_synch=True, z_query_attempts=2):
+    """
+    Get sources with spectroscopic redshifts within the bounds of an image using its WCS.
+
+    Parameters
+    ----------
+    image : 2D array
+        The input image.
+    wcs : astropy.wcs.WCS
+        The WCS object corresponding to the image.
+    z_query_timeout : int, optional
+        Timeout for the Z query in seconds. Default is 20.
+    z_query_synch : bool, optional
+        Whether to perform a synchronous Z query. Default is True.
+    z_query_attempts : int, optional
+        Number of attempts for the Z query. Default is 2.
+
+    Returns
+    -------
+    z_sources_from_query : astropy.table.Table
+        Table of sources with spectroscopic redshifts within the image bounds.
+    """
+    from .z_queries.z_fetcher import query_nearby_z_sources
+    image_bounds_coords = _get_box_bounds(wcs, image)
+    z_sources_from_query_df, failed_z_query = query_nearby_z_sources(image_bounds_coords,
+                                                                     timeout=z_query_timeout,
+                                                                     synchronous=z_query_synch,
+                                                                     attempts=z_query_attempts)
+    z_sources_from_query_df = _coords_to_pixels(z_sources_from_query_df, wcs)
+    z_sources_from_query = Table.from_pandas(z_sources_from_query_df)
+    return z_sources_from_query, failed_z_query
+
+def square_region_from_cone_search(sources, RA_range, DEC_range):
+    """
+    Filter sources based on RA and DEC ranges, handling the case where RA wraps around 0/360 degrees.
+    """
+    leap_ra = _check_ra_range_leap(RA_range)
+
+    if sources is not None:
+        if not leap_ra:
+            sources = sources[(sources['ra'] >= RA_range[0]) & (sources['ra'] <= RA_range[1]) &
+                              (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
+        else:
+            sources = sources[(((sources['ra'] >= RA_range[0]) & (sources['ra'] <= 360)) |
+                               ((sources['ra'] <= RA_range[1]) & (sources['ra'] >= 0))) &
+                              (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
+
+    return sources
+
+def remove_low_outliers(image, sigma=5):
+    """
+    Remove low outliers from an image by replacing them with random values drawn from a normal distribution
+    """
+    bkg_lvl, bkg_std = sigma_clipping(image)
+    outlier_mask = image < bkg_lvl - sigma * bkg_std
+    image[outlier_mask] = np.random.normal(loc=bkg_lvl, scale=bkg_std, size=np.sum(outlier_mask))
+    return image
+
+def layered_contour_averaging(region_mask, image, neighbor_weight=0.5, max_layers=None, connectivity=4,
+                              noise_sample=None):
+    """
+    Perform layered contour averaging on an image using a specified region mask.
+
+    Parameters
+    ----------
+    region_mask : np.ndarray
+        A boolean mask indicating the region to be averaged.
+    image : np.ndarray
+        The input image to be averaged.
+    neighbor_weight : float, optional
+        The weight given to neighboring pixels during averaging. Must be between 0 and 1.
+    max_layers : int, optional
+        The maximum number of layers to process. If None, all layers will be processed.
+    connectivity : int, optional
+        The connectivity for defining neighbors (4 or 8). Default is 4.
+    noise_sample : np.ndarray, optional
+        An array of noise values to sample from. If None, no noise will be added.
+
+    Returns
+    -------
+    np.ndarray
+        The averaged image with the specified region filled in.
+    """
+
+    assert 0 <= neighbor_weight <= 1, "neighbor_weight must be between 0 and 1"
+    assert connectivity in (4, 8), "connectivity must be either 4 or 8"
+
+    averaged_image = image.copy()
+    current_mask = region_mask.copy()
+    previous_contour_mask = binary_dilation(region_mask) & ~region_mask
+
+    # Neighbor offsets depending on connectivity
+    if connectivity == 4:
+        neighbor_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    else:  # 8-connectivity
+        neighbor_offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if
+                            not (dy == 0 and dx == 0)]
+    if noise_sample is not None:
+        noise_mean = np.mean(noise_sample)
+    else:
+        noise_mean = 0
+
+    layer_count = 0
+    while np.any(current_mask):
+        if max_layers is not None and layer_count >= max_layers:
+            break
+        layer_count += 1
+
+        contour_mask = current_mask & ~binary_erosion(current_mask)
+        contour_coords = np.argwhere(contour_mask)
+
+        for y, x in contour_coords:
+            neighbors = []
+            for dy, dx in neighbor_offsets:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < image.shape[0] and 0 <= nx < image.shape[1]:
+                    if previous_contour_mask[ny, nx]:
+                        neighbors.append(averaged_image[ny, nx])
+            if neighbors:
+                if noise_sample is not None:
+                    noise_pix = np.random.choice(noise_sample)
+                else:
+                    noise_pix = 0
+                averaged_image[y, x] = ((1 - neighbor_weight) * averaged_image[y, x] +
+                                        neighbor_weight * np.mean(neighbors)
+                                        ) + noise_pix - noise_mean
+
+        current_mask = binary_erosion(current_mask)
+        previous_contour_mask = contour_mask.copy()
+
+    return averaged_image
+
+def contour_interpolation(region_mask, image, connectivity=8, add_noise=True, noise_sample=None, decay_threshold=0.1,
+                          influence_radius=5):
+    """
+    Perform contour-based interpolation on an image using a specified region mask.
+
+    Parameters
+    ----------
+    region_mask : np.ndarray
+        A boolean mask indicating the region to be interpolated.
+    image : np.ndarray
+        The input image to be interpolated.
+    connectivity : int, optional
+        The connectivity for defining neighbors (4 or 8). Default is 8.
+    add_noise : bool, optional
+        Whether to add noise to the interpolated region. Default is True.
+    noise_sample : np.ndarray, optional
+        An array of noise values to sample from. If None, noise will be generated automatically.
+    decay_threshold : float, optional
+        The decay threshold for neighbor influence. Default is 0.1.
+    influence_radius : int, optional
+        The radius of influence for neighbor averaging. Default is 5.
+
+    Returns
+    -------
+    np.ndarray
+        The interpolated image with the specified region filled in.
+    """
+
+    # First get the parameters to then perform an outside-in layer averaging based interpolation with layered_contour_averaging()
+    if add_noise and noise_sample is None:
+        background, background_std = sigma_clipping(image, iteration_limit=50, use_median=False)
+        noise_sample = np.random.normal(loc=0, scale=background_std, size=np.sum(region_mask))
+    elif not add_noise:
+        noise_sample = None
+    neighbor_initial_weight = np.pow(decay_threshold, (1 / (influence_radius)))
+    image = layered_contour_averaging(region_mask, image, neighbor_weight=neighbor_initial_weight,
+                                      connectivity=connectivity, max_layers=None, noise_sample=noise_sample)
+    return image
+
 def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration_limit=50, use_median=False,
                    use_iqr = False, robust=False, direction = "symmetric"):
+    """
+    Perform sigma clipping on an image to estimate the central value and spread.
+
+    Parameters
+    ----------
+    image : 2D array
+        Input image for sigma clipping.
+    sigma_factor : float, optional
+        Factor to determine the clipping threshold. Default is 3.
+    convergence_tolerance : float, optional
+        Tolerance for convergence of the central measure. Default is 0.001.
+    iteration_limit : int, optional
+        Maximum number of iterations for the clipping process. Default is 50.
+    use_median : bool, optional
+        Whether to use median instead of mean for the central measure. Default is False.
+    use_iqr : bool, optional
+        Whether to use interquartile range (IQR) instead of standard deviation for the spread. Default is False.
+    robust : bool, optional
+        Whether to use a robust method for outlier rejection. Default is False.
+    direction : str, optional
+        Direction of clipping: "up", "down", or "symmetric". Default is "symmetric".
+
+    Returns
+    -------
+    central_measure : float
+        The estimated central value (mean or median) after sigma clipping.
+    sigma : float
+        The estimated spread (standard deviation or IQR) after sigma clipping.
+    """
+
+
     # Will return mean and standard deviation or median and iqr depending on use_median
     # If convergence_tolerance, the clipping will go on until there is no change in the central measurement or the iteration_limit is exceeded
 
@@ -946,296 +1398,5 @@ def sigma_clipping(image, sigma_factor=3, convergence_tolerance=0.001, iteration
 
     return central_measure, sigma
 
-def remove_low_outliers(image, sigma=5):
-    bkg_lvl, bkg_std = sigma_clipping(image)
-    outlier_mask = image < bkg_lvl - sigma * bkg_std
-    image[outlier_mask] = np.random.normal(loc=bkg_lvl, scale=bkg_std, size=np.sum(outlier_mask))
-    return image
 
 
-def linear_kernel(type=8, center_weight=2.0):
-    if type == 8:
-        kernel = np.ones((3, 3))  # includes center
-    elif type == 4:
-        kernel = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
-    else:
-        kernel = np.array(
-            [[0.25, 0.5, 0.75, 0.5, 0.25], [0.5, 0.75, 1, 0.75, 0.5], [0.75, 1, 1, 1, 0.75], [0.5, 0.75, 1, 0.75, 0.5],
-             [0.25, 0.5, 0.75, 0.5, 0.25]])
-
-    kernel[kernel.shape[0] // 2, kernel.shape[1] // 2] = center_weight
-    # normalize kernel so sum of neighbor weights = 1 (optional)
-    kernel = kernel / kernel.sum()
-    return kernel
-
-def get_image_centroid(image):
-    x_coords = np.linspace(0, image.shape[1] - 1, image.shape[1]).astype('int')
-    y_coords = np.linspace(0, image.shape[0] - 1, image.shape[0]).astype('int')
-    x_mean = np.mean(image, axis=0)
-    y_mean = np.mean(image, axis=1)
-    x_mean_sum = np.sum(x_mean)
-    y_mean_sum = np.sum(y_mean)
-    if x_mean_sum <= 0 or y_mean_sum <= 0:
-        return None
-    x_centroid = int(np.sum(x_mean * x_coords) / x_mean_sum)
-    y_centroid = int(np.sum(y_mean * y_coords) / y_mean_sum)
-    return (x_centroid, y_centroid)
-
-def grow_pixel_circular(mask_shape, center, radius):
-    """
-    Grow a pixel in a circular region around the center.
-
-    Parameters:
-    - mask_shape: tuple, shape of the output mask (height, width)
-    - center: tuple, (row, col) coordinate of the pixel to grow
-    - radius: int, radius of the circular growth
-
-    Returns:
-    - A boolean mask of the same shape with True in the circular region
-    """
-    rows, cols = np.ogrid[:mask_shape[0], :mask_shape[1]]
-    cy, cx = center
-    dist_sq = (rows - cy)**2 + (cols - cx)**2
-    circle_mask = dist_sq <= radius**2
-    return circle_mask
-
-def adjust_image_resolution_to_scale(image, scale = 1):
-    if scale < 1:
-        print("Scale cannot be less than 1. Forcing scale to 1")
-        scale = 1
-    scaling_factor = 2 * (scale - 1) / np.power(scale, 2)
-    pre_smoothing_image_mean = np.mean(image)
-    # Kernels
-    k_orth = np.array([[0, 1, 0],
-                       [1, 0, 1],
-                       [0, 1, 0]], dtype=float)
-
-    # Diagonal (corners)
-    k_diag = np.array([[1, 0, 1],
-                       [0, 0, 0],
-                       [1, 0, 1]], dtype=float)
-
-    # Sums of neighbors
-    sum_orth = sci_convolve(image, k_orth, mode='constant', cval=0.0)
-    sum_diag = sci_convolve(image, k_diag, mode='constant', cval=0.0)
-
-    # Final update
-    scaling_factor_diag = scaling_factor * (scale - 1) / 2.0
-    scaling_factor_total = scaling_factor + scaling_factor_diag
-    new_image = (
-            (1 - scaling_factor_total) * image
-            + scaling_factor * sum_orth
-            + (scaling_factor * (scale - 1) / 2.0) * sum_diag
-    )
-    image = new_image
-    # Correcting mean for artificial increase due to averaging
-    image -= (np.mean(image) - pre_smoothing_image_mean)
-    return image
-
-def has_false_neighbor(mask: np.ndarray, region_mask: np.ndarray, connect_type = 4) -> bool:
-    """
-    Returns True if any cell in region_mask has a False neighbor in mask.
-    """
-    # Create a structuring element to define 4- or 8-connected neighborhood
-    if connect_type == 8:
-        structure = np.array([[1, 1, 1],
-                              [1, 1, 1],
-                              [1, 1, 1]])
-    else:
-        structure = np.array([[0, 1, 0],
-                              [1, 1, 1],
-                              [0, 1, 0]])
-
-    # Dilate the region to get the region + its neighbors
-    dilated = binary_dilation(region_mask, structure=structure)
-
-    # Exclude original region to keep only the border/neighbor cells
-    neighbors = dilated & ~region_mask
-
-    # Now check if any of the neighbors are False in the main mask
-    return np.any(~mask & neighbors)
-
-def interpolate_image(image_data, mask_data, mask_radius = 3, method = "inpaint"):
-    interpolated_img = image_data.copy()
-    if method == "inpaint":
-        inpaint_r = np.max((round(mask_radius/2,0),2))
-        img_max = np.max(image_data)
-        img_min = np.min(image_data)
-        mask_data_cv = (mask_data.astype(np.uint8)) * 255
-        norm_img = 255*((image_data - img_min) / (img_max - img_min)).astype(np.float32)
-        inpainted = cv2.inpaint(norm_img, mask_data_cv, inpaintRadius=inpaint_r, flags=cv2.INPAINT_NS)
-        interp_img = inpainted/255 * (img_max - img_min) + img_min
-        interpolated_img[mask_data] = interp_img[mask_data]
-
-    else:
-        non_masked_coords = []
-        non_masked_values = []
-        for i in range(mask_data.shape[0]):
-            for j in range(mask_data.shape[1]):
-                if mask_data[i, j]:
-                    continue
-                non_masked_coords.append((i, j))
-                non_masked_values.append(image_data[i, j])
-        interp_img = LinearNDInterpolator(non_masked_coords, non_masked_values)
-        for i in range(image_data.shape[0]):
-            for j in range(image_data.shape[1]):
-                if mask_data[i, j]:
-                    interpolated_img[i, j] = interp_img(i, j)
-
-    return interpolated_img
-
-def separate_segments(labels, omit_background=True):
-    labels = np.array(labels, copy=True)
-    h, w = labels.shape
-    structure = generate_binary_structure(2, 1)  # 4-connectivity
-
-    for lbl in np.unique(labels):
-        if lbl == -1:
-            continue  # skip special labels if desired
-        if omit_background and lbl == 0:
-            continue  # skip background if requested
-
-        # Binary mask for this label
-        mask = (labels == lbl)
-
-        # Label connected components inside this label's mask
-        labeled, num = label(mask, structure=structure)
-
-        if num <= 1:
-            continue  # only one region, nothing to do
-
-        # Find largest component ID
-        sizes = np.bincount(labeled.ravel())
-        sizes[0] = 0  # background of component labeling
-        largest_id = sizes.argmax()
-
-        for comp_id in range(1, num + 1):
-            if comp_id == largest_id:
-                continue  # keep main region
-
-            # Coordinates of this small component
-            coords = np.argwhere(labeled == comp_id)
-
-            # Find neighboring labels
-            neighbor_labels = []
-            for x, y in coords:
-                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < h and 0 <= ny < w:
-                        if labels[nx, ny] != lbl:
-                            neighbor_labels.append(labels[nx, ny])
-
-            if neighbor_labels:
-                # Most common neighbor label
-                new_lbl = Counter(neighbor_labels).most_common(1)[0][0]
-                labels[labeled == comp_id] = new_lbl
-
-    return labels
-
-def get_z_sources_in_image(image, wcs, z_query_timeout, z_query_synch, z_query_attempts=2):
-    from .z_queries.z_fetcher import query_nearby_z_sources
-    image_bounds_coords = _get_box_bounds(wcs, image)
-    z_sources_from_query_df, failed_z_query = query_nearby_z_sources(image_bounds_coords,
-                                                                  timeout=z_query_timeout,
-                                                                  synchronous=z_query_synch, attempts=z_query_attempts)
-    z_sources_from_query_df = coords_to_pixels(z_sources_from_query_df, wcs)
-    z_sources_from_query = Table.from_pandas(z_sources_from_query_df)
-    return z_sources_from_query, failed_z_query
-
-def coords_to_pixels(sources, wcs):
-    sources['x_pos'] = -1.
-    sources['y_pos'] = -1.
-    for zsrc_id, zsrc_ra, zsrc_dec in zip(sources["object_id"], sources["ra"], sources["dec"]):
-        z_source_coords = SkyCoord(zsrc_ra * u.deg, zsrc_dec * u.deg, frame='icrs')
-        z_source_x_pix, z_source_y_pix = wcs.world_to_pixel(z_source_coords)
-        sources.loc[sources['object_id'] == zsrc_id, 'x_pos'] = z_source_x_pix
-        sources.loc[sources['object_id'] == zsrc_id, 'y_pos'] = z_source_y_pix
-    sources = sources[(sources['x_pos'] >= 0) & (sources['y_pos'] >= 0)]
-    return (sources)
-
-def _check_ra_range_leap(ra_range):
-    dir_dif = abs(ra_range[1] - ra_range[0])
-    skip_dif = abs(ra_range[1] + 360 - ra_range[0])
-    if dir_dif > skip_dif and (ra_range[1]<ra_range[0]):
-        return True
-    else:
-        return False
-
-
-def square_region_from_cone_search(sources, RA_range, DEC_range):
-    leap_ra = _check_ra_range_leap(RA_range)
-
-    if sources is not None:
-        if not leap_ra:
-            sources = sources[(sources['ra'] >= RA_range[0]) & (sources['ra'] <= RA_range[1]) &
-                              (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
-        else:
-            sources = sources[(((sources['ra'] >= RA_range[0]) & (sources['ra'] <= 360)) |
-                               ((sources['ra'] <= RA_range[1]) & (sources['ra'] >= 0))) &
-                              (sources['dec'] >= DEC_range[0]) & (sources['dec'] <= DEC_range[1])]
-
-    return sources
-
-def contour_interpolation(region_mask, image, connectivity=8, add_noise=True, noise_sample=None, decay_threshold=0.1,
-                          influence_radius=5):
-    # Will get the parameters to then perform an outside-in layer averaging based interpolation with layered_contour_averaging()
-    if add_noise and noise_sample is None:
-        background, background_std = sigma_clipping(image, iteration_limit=50, use_median=False)
-        noise_sample = np.random.normal(loc=0, scale=background_std, size=np.sum(region_mask))
-    elif not add_noise:
-        noise_sample = None
-    neighbor_initial_weight = np.pow(decay_threshold, (1 / (influence_radius)))
-    image = layered_contour_averaging(region_mask, image, neighbor_weight=neighbor_initial_weight,
-                                      connectivity=connectivity, max_layers=None, noise_sample=noise_sample)
-    return image
-
-def layered_contour_averaging(region_mask, image, neighbor_weight=0.5, max_layers=None,
-                              connectivity=4, noise_sample=None):
-
-    assert 0 <= neighbor_weight <= 1, "neighbor_weight must be between 0 and 1"
-    assert connectivity in (4, 8), "connectivity must be either 4 or 8"
-
-    averaged_image = image.copy()
-    current_mask = region_mask.copy()
-    previous_contour_mask = binary_dilation(region_mask) & ~region_mask
-
-    # Neighbor offsets depending on connectivity
-    if connectivity == 4:
-        neighbor_offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    else:  # 8-connectivity
-        neighbor_offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if
-                            not (dy == 0 and dx == 0)]
-    if noise_sample is not None:
-        noise_mean = np.mean(noise_sample)
-    else:
-        noise_mean = 0
-
-    layer_count = 0
-    while np.any(current_mask):
-        if max_layers is not None and layer_count >= max_layers:
-            break
-        layer_count += 1
-
-        contour_mask = current_mask & ~binary_erosion(current_mask)
-        contour_coords = np.argwhere(contour_mask)
-
-        for y, x in contour_coords:
-            neighbors = []
-            for dy, dx in neighbor_offsets:
-                ny, nx = y + dy, x + dx
-                if 0 <= ny < image.shape[0] and 0 <= nx < image.shape[1]:
-                    if previous_contour_mask[ny, nx]:
-                        neighbors.append(averaged_image[ny, nx])
-            if neighbors:
-                if noise_sample is not None:
-                    noise_pix = np.random.choice(noise_sample)
-                else:
-                    noise_pix = 0
-                averaged_image[y, x] = ((1 - neighbor_weight) * averaged_image[y, x] +
-                                         neighbor_weight * np.mean(neighbors)
-                                       ) + noise_pix - noise_mean
-
-        current_mask = binary_erosion(current_mask)
-        previous_contour_mask = contour_mask.copy()
-
-    return averaged_image

@@ -10,8 +10,8 @@ from .others import flatten_background, mask_secondary_detections, clear_backgro
 import traceback
 import time
 
-# TODO: Artifact, deblending, background suppressor and OTHERS are ready.
-#  Need to check: stars, utils, configs and pipeline (and remove timers)!
+# TODO: Artifact, deblending, background suppressor, utils and OTHERS are ready.
+#  Need to check: stars, configs and pipeline (and remove timers)!
 
 def update_sources(sources_table, artifact_mask):
     if (artifact_mask == True).any():
