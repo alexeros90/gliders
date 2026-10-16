@@ -42,6 +42,6 @@ GLIDErS uses a configuration object to control source detection, masking, and de
 
 See the [`LICENSE`](LICENSE) file for licensing information.
 
-- **GitHub:** [View the source code](https://github.com/YOUR_USERNAME/GLIDErS)
+- **GitHub:** [View the source code](https://github.com/alexeros90/gliders)
 - **PyPI:** [View the package on PyPI](https://pypi.org/project/GLIDErS/)
-- **Issues:** [Report a bug or request a feature](https://github.com/YOUR_USERNAME/GLIDErS/issues)
+- **Issues:** [Report a bug or request a feature](https://github.com/alexeros90/gliders/issues)
