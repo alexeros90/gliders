@@ -388,7 +388,7 @@ def smooth_region_edge(image, region_mask, bordering_mask=None, layers=5, backgr
         current_layer = grow_mask(current_layer, 1)
 
     image = add_noise_to_region(image, previous_layer & ~region_mask, noise_center=background,
-                                noise_std=background_std, scale=pix_scale)
+                                noise_std=background_std, pix_scale=pix_scale)
 
     return image
 

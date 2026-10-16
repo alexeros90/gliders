@@ -53,20 +53,20 @@ def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
 
     return all_bands, all_weights, ref_hdu
 
-# file_dir = ""
-# file_dir = "C:\Astrostuff\PhD\Data\DESI FITS"
-file_dir = "C:\Astrostuff\PhD\Data\DESI FITS\DESI_dwarf_AGN_fits"
+file_dir = "test_images"
 
-# object_info = (39627847656019106,150.98807,2.41803,0.02661) # ID, RA, DEC, redshift
-# object_info = (39633244085289292,173.47971,49.84688, 0.0821)
-object_info = (39627773882401920,73.5449,-0.39993,0.05467)
+object_info = (39627847656019106,150.98807,2.41803,0.02661) # ID, RA, DEC, redshift
+# object_info = (39633134743983521,97.82606,43.26419,0.03704)
+# object_info = (39627800365237809,212.08071,0.62104,0.04099)
+# object_info = (39632946293902671,217.8555,33.23049,0.02262)
+# object_info = (39633140817332668,234.14644,43.42465,0.01934)
+
 
 object_id = object_info[0]
 obj_coords = (object_info[1],object_info[2])
 redshift = object_info[3]
 bands = ['r']
-# file_name = f"{object_id}_{bands[0]}.fits"
-file_name = f"{object_id}_rg.fits"
+file_name = f"{object_id}_{bands[0]}.fits"
 sources_name = f"{object_id}_sources.fits"
 
 file_path = os.path.join(file_dir, file_name)
@@ -94,15 +94,16 @@ raw_image = all_bands['r']
 results = gl.clean_image(raw_image, redshift=redshift, wcs=wcs, mask_stars = True, show_plots=False, deblend_sources = True,
                          mask_sec_objects = True, clean_artifacts = True, phot_sources = phot_sources, source_pos=source_pos,
                          pix_scale = pix_scale, verbose = True, skip_flagged_artifacts = False, deblend_delta_z = 0.01,
-                         deblend_with_redshift = False, deblend_with_photo_type = True, sync_z_query = False, smooth_segmap = False)
+                         deblend_with_redshift = True, deblend_with_photo_type = True, sync_z_query = False, smooth_segmap = False,
+                         reduce_noise_level = False)
 
 clean_image, seg_map, removal_mask, cleaning_flags = results
 
 print(cleaning_flags)
 fig, ax = plt.subplots(2,2, figsize = (6,6))
-ax[0,0].imshow(raw_image-np.min(raw_image)+0.05, norm = "log", origin = "lower", cmap = "magma")
+ax[0,0].imshow(raw_image-np.min(raw_image), norm = "log", origin = "lower", cmap = "magma")
 ax[0,0].set_title("Raw image")
-ax[0,1].imshow(clean_image-np.min(clean_image)+0.005, norm = "log", origin = "lower", cmap = "magma")
+ax[0,1].imshow(clean_image-np.min(clean_image), norm = "log", origin = "lower", cmap = "magma")
 ax[0,1].set_title("Clean image")
 ax[1,0].imshow(seg_map, origin = "lower")
 ax[1,0].set_title("Segmentation map")
