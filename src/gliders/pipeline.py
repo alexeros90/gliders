@@ -8,12 +8,24 @@ from .deblending import deblend_and_mask_sources
 from .artifacts import detect_and_clean_artifacts
 from .others import flatten_background, mask_secondary_detections, clear_background, segmentation_map_smoothing
 import traceback
-import time
-
-# TODO: Artifact, deblending, background suppressor, utils and OTHERS are ready.
-#  Need to check: stars, configs and pipeline (and remove timers)!
+import warnings
 
 def update_sources(sources_table, artifact_mask):
+    """
+    Update the sources table with detected artifacts.
+
+    Parameters:
+    -----------
+    sources_table : astropy.table.Table
+        Table containing detected sources.
+    artifact_mask : numpy.ndarray
+        Boolean mask indicating the location of detected artifacts.
+
+    Returns:
+    --------
+    astropy.table.Table
+        Updated sources table with detected artifacts added.
+    """
     if (artifact_mask == True).any():
         artifact_segmap = detect_sources(artifact_mask, 0.5, 1, connectivity=8)
         artifact_table = SourceCatalog(artifact_mask, artifact_segmap).to_table()
@@ -23,6 +35,38 @@ def update_sources(sources_table, artifact_mask):
     return sources_table
 
 def update_detections(image, config = None, source_min_pix = 1, source_pos = None, use_filter = True, verbose = False):
+    """
+    Update the detections in the image by convolving with a Gaussian kernel,
+    detecting sources, and extracting the main source segment.
+
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        The input image in which to detect sources.
+    config : Config, optional
+        Configuration object containing parameters for source detection.
+        If None, the default configuration will be used.
+    source_min_pix : int, optional
+        Minimum number of pixels for a source to be detected. Default is 1.
+    source_pos : tuple or list, optional
+        The (x, y) position of the main source. If None, the center of the image will be used.
+    use_filter : bool, optional
+        Whether to convolve the image with a Gaussian kernel before detection. Default is True.
+    verbose : bool, optional
+        Whether to print progress messages. Default is False.
+
+    Returns:
+    --------
+    tuple
+        A tuple containing:
+        - image_for_detection : numpy.ndarray
+            The image used for source detection (possibly convolved).
+        - seg_map : photutils.segmentation.SegmentationImage
+            The segmentation map of detected sources.
+        - main_source_segmap : photutils.segmentation.SegmentationImage
+            The segmentation map of the main source.
+    """
+
     if config is None:
         if verbose:
             print("No config provided. Using default config.")
@@ -53,14 +97,291 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
                 deblend_sources = True, deblend_with_redshift = True, deblend_delta_z = None, keep_undecided_segments = True,
                 deblend_with_photo_type = True, robust_background = True, sync_z_query = False,
                 clear_all_but_segment = False, smooth_segmap = True, pix_scale = 1, verbose = True, show_plots = False):
+    """
+    Clean an astronomical image while preserving the main target source.
+
+    This function applies a configurable sequence of image-cleaning
+    operations to reduce contamination from overexposure artifacts, stars,
+    secondary sources, and overlapping objects. It detects the main source,
+    optionally deblends neighboring sources, removes unwanted detections,
+    and refines the main-source segmentation map.
+
+    The main source is identified using ``source_pos``. If the supplied
+    position is missing, non-finite, or outside the image boundaries, the
+    image center is used instead.
+
+    The cleaning pipeline can include the following operations:
+
+    1. Validate the image and initialize the cleaning configuration.
+    2. Optionally detect and clean overexposure artifacts.
+    3. Optionally subtract the background and suppress background noise.
+    4. Detect sources and identify the main-source segment.
+    5. Optionally detect and mask contaminating stars.
+    6. Optionally deblend neighboring sources using redshift and/or
+       photometric-type information.
+    7. Optionally mask secondary detections.
+    8. Optionally smooth the main-source segmentation map.
+    9. Optionally remove everything outside the main-source segment.
+    10. Optionally remove low-intensity outliers.
+    11. Evaluate source size, image-edge contact, and positional offset.
+
+    A Boolean cleaning mask records pixels marked as cleaned by the
+    artifact-removal, star-masking, deblending, and secondary-object
+    masking operations. The function also returns a list of integer flags
+    summarizing potential issues identified during processing.
+
+    Parameters
+    ----------
+    image : numpy.ndarray
+        Two-dimensional input image containing the main astronomical source
+        and any contaminating sources or artifacts. The image is processed
+        sequentially and may be modified or replaced by intermediate
+        cleaning operations.
+
+        An image containing only zero-valued pixels is rejected.
+
+    image_psf : numpy.ndarray or None, optional
+        Reference point spread function (PSF) image passed to the star
+        detection and masking procedure. Used to help identify and validate
+        stellar sources. Default is ``None``.
+
+    config : object or None, optional
+        Configuration object controlling source detection, artifact
+        cleaning, masking, deblending, and interpolation parameters.
+
+        If ``None``, the default configuration is loaded from
+        ``cleaning_configs.configs["default"]``. The function prints a
+        message indicating that the default configuration is being used.
+
+        The configuration must provide the attributes required by the
+        enabled processing routines, including ``source_min_pix``,
+        ``artifact_candidate_ratio``, ``galaxy_detection_threshold``,
+        ``big_contaminator_pix_ratio``, and ``z_query_timeout``.
+        Additional attributes may be required by downstream routines.
+        Default is ``None``.
+
+    source_pos : array-like or None, optional
+        Approximate position of the main source, specified as
+        ``(x, y)`` in image pixel coordinates.
+
+        If the position is ``None``, contains non-finite values, or falls
+        outside the image boundaries, the image center is used. Otherwise,
+        both coordinates are rounded to the nearest integer pixel.
+        Default is ``None``.
+
+    redshift : float or None, optional
+        Redshift estimate for the main source. Passed to the deblending
+        procedure when ``deblend_sources=True`` and used according to the
+        configured redshift-based source-selection criteria. Default is
+        ``None``.
+
+    z_sources : object or None, optional
+        Additional source-redshift information supplied to the deblending
+        procedure. The expected format depends on
+        ``deblend_and_mask_sources``. Default is ``None``.
+
+    query_z_sources : bool, optional
+        If ``True``, allow the deblending procedure to query external
+        redshift information when supported. The exact behavior depends
+        on ``deblend_and_mask_sources``. Default is ``True``.
+
+    wcs : object or None, optional
+        World Coordinate System object passed to the deblending procedure
+        for coordinate transformations or source matching. Default is
+        ``None``.
+
+    phot_sources : object or None, optional
+        Photometric source catalog used by the star-detection and
+        deblending procedures.
+
+        If ``None``, an empty Astropy table with ``'type'``,
+        ``'x_centroid'``, and ``'y_centroid'`` columns is initialized.
+        Default is ``None``.
+
+    clean_artifacts : bool, optional
+        If ``True``, check for and clean potential overexposure artifacts.
+        Artifact detection is attempted only if the ratio of the maximum
+        image intensity to the estimated background level exceeds
+        ``config.artifact_candidate_ratio``. Default is ``True``.
+
+    skip_flagged_artifacts : bool, optional
+        If ``True``, instruct the artifact-cleaning procedure to skip
+        artifacts that meet its flagged-artifact criteria. The exact
+        behavior is defined by ``detect_and_clean_artifacts``.
+        Default is ``True``.
+
+    reduce_noise_level : bool, optional
+        If ``True``, suppress background noise using the logit-based
+        ``suppress_background`` method. Default is ``False``.
+
+    subtract_background : bool, optional
+        If ``True``, flatten the image background using
+        ``flatten_background`` with the configured source-detection
+        threshold and minimum source-pixel count. Default is ``False``.
+
+    mask_sec_objects : bool, optional
+        If ``True``, mask secondary detections after deblending and other
+        source-cleaning operations. The corresponding mask is added to the
+        overall cleaning mask. Default is ``True``.
+
+    mask_stars : bool, optional
+        If ``True``, detect and mask contaminating stars using
+        ``detect_and_mask_stars``. Also evaluates whether the main source
+        is significantly contaminated by stars. Default is ``True``.
+
+    deblend_sources : bool, optional
+        If ``True``, deblend overlapping sources and mask unwanted
+        contributions using ``deblend_and_mask_sources``. The segmentation
+        map and convolved image are subsequently updated. Default is
+        ``True``.
+
+    deblend_with_redshift : bool, optional
+        If ``True``, enable redshift-based criteria in the deblending
+        procedure. The actual selection behavior depends on the
+        implementation of ``deblend_and_mask_sources``. Default is ``True``.
+
+    deblend_delta_z : float or None, optional
+        Redshift difference threshold supplied to the deblending procedure
+        for distinguishing sources according to their redshifts.
+        The precise interpretation depends on ``deblend_and_mask_sources``.
+        Default is ``None``.
+
+    keep_undecided_segments : bool, optional
+        If ``True``, instruct the deblending procedure to retain segments
+        whose association with the main source cannot be decided confidently.
+        The exact behavior depends on ``deblend_and_mask_sources``.
+        Default is ``True``.
+
+    deblend_with_photo_type : bool, optional
+        If ``True``, enable photometric-type information in the deblending
+        procedure when determining which sources or segments to retain.
+        Default is ``True``.
+
+    robust_background : bool, optional
+        If ``True`` and ``clear_all_but_segment=False``, remove low-intensity
+        outliers using ``remove_low_outliers`` after the other cleaning
+        operations. This step is skipped when ``clear_all_but_segment=True``.
+        Default is ``True``.
+
+    sync_z_query : bool, optional
+        If ``True``, request synchronous redshift-query behavior from the
+        deblending procedure. If ``show_plots=True``, this parameter is
+        automatically set to ``True``. Default is ``False``.
+
+    clear_all_but_segment : bool, optional
+        If ``True``, clear the image outside the final main-source mask
+        using ``clear_background``. Default is ``False``.
+
+    smooth_segmap : bool, optional
+        If ``True``, smooth the main-source segmentation map before
+        generating the final source mask. Default is ``True``.
+
+    pix_scale : float, optional
+        Pixel-scale factor passed to applicable artifact, star-masking,
+        deblending, and background-clearing routines. Some operations may
+        use their own fixed scale values. Default is 1.
+
+    verbose : bool, optional
+        If ``True``, print progress messages and warnings during processing.
+        Also controls the verbosity passed to several downstream routines.
+        Default is ``True``.
+
+    show_plots : bool, optional
+        If ``True``, enable plots in supported downstream routines.
+        Also forces ``sync_z_query=True``. Default is ``False``.
+
+    Returns
+    -------
+    image : numpy.ndarray
+        The cleaned image after the enabled artifact-removal, background
+        processing, star masking, deblending, secondary-object masking,
+        and outlier-removal operations.
+
+    main_source_segment : object
+        Final segmentation-map object corresponding to the main source.
+        May have been smoothed if ``smooth_segmap=True``. Its source mask
+        can be obtained using ``main_source_segment.make_source_mask()``.
+
+    cleaning_mask : numpy.ndarray
+        Boolean array with the same shape as the input image, indicating
+        pixels marked by the artifact-cleaning, star-masking, deblending,
+        and secondary-object masking operations.
+
+        The mask is initialized to all ``False``. It is updated by
+        combining the masks returned by the relevant cleaning procedures.
+        Background subtraction, noise suppression, segmentation smoothing,
+        low-outlier removal, and inner-star interpolation are not necessarily
+        represented in this mask.
+
+    cleaning_flags : list of int
+        List of six integer flags, each equal to 0 or 1, in the following
+        order:
+
+        1. ``unsafe_artifact_flag``:
+           Set if the artifact-cleaning procedure reports unsafe artifacts.
+        2. ``offset_source_flag``:
+           Set if the main-source position is sufficiently far from the
+           image center or the final source mask touches an image boundary.
+        3. ``deblended_flag``:
+           Set if the deblending procedure reports that deblending occurred.
+        4. ``deblend_bad_z_query_flag``:
+           Set if the deblending procedure reports a redshift-query problem.
+        5. ``big_contaminator_flag``:
+           Set if the star-contamination check detects significant
+           contamination according to the configured threshold.
+        6. ``small_source_flag``:
+           Set if the final main-source mask contains fewer pixels than
+           ``config.source_min_pix``.
+
+    Raises
+    ------
+    Exception
+        If the input image contains no nonzero pixels.
+
+    Exception
+        If no source is detected at the expected source position, as
+        determined by the segmentation map.
+
+    Other exceptions
+        Exceptions raised by configuration access, source detection,
+        artifact cleaning, masking, deblending, or other processing steps
+        are printed with their traceback and re-raised.
+
+    Notes
+    -----
+    The source position is represented in ``(x, y)`` order, whereas
+    NumPy image indexing uses ``(row, column)`` order. The function
+    accounts for this distinction when checking the segmentation map.
+
+    The estimated background level and standard deviation are computed
+    at the beginning of processing. The background level is used for the
+    artifact-candidate check, while the background standard deviation is
+    not directly used elsewhere in this function.
+
+    If ``show_plots=True``, redshift queries are forced into synchronous
+    mode, regardless of the supplied value of ``sync_z_query``.
+
+    The offset-source flag is evaluated using the selected source position
+    and the final main-source mask. The positional criterion compares the
+    source position with the image center using a threshold equal to one
+    quarter of the image diagonal.
+
+    The function prints a full traceback and re-raises any exception
+    encountered during processing. It does not return a partial cleaning
+    result when an exception occurs.
+
+    """
+
     try:
         # ------------ Handling input parameters ------------
         if not np.any(image.astype(bool)):
             raise Exception("Image appears to be empty.")
         if config is None:
-            print("No config provided. Using default config.")
+            if verbose:
+                warnings.warn("No configuration object was provided. Will use default configuration.",
+                              UserWarning, stacklevel=2)
             from .cleaning_configs import configs
-            config = configs["default"]
+            config = configs['default']
         if phot_sources is None:
             phot_sources = Table(names=['type','x_centroid','y_centroid'], dtype=('str', 'float', 'float'))
         ny, nx = image.shape
@@ -85,7 +406,6 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         small_source_flag = False
         # ---------------------------------------------------
 
-        # times["initial_images"] = time.perf_counter()
 
         cleaning_mask = np.full(image.shape, False) # Initializing the overall cleaning mask
 
@@ -101,18 +421,16 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
                                                                                         verbose = verbose, show_plots=show_plots)
                 cleaning_mask = artifact_mask | cleaning_mask
                 phot_sources = update_sources(phot_sources, artifact_mask) # Adding detected artifacts to photo source table
-                # times["artifact_cleaning"] = time.perf_counter()
 
 
         if subtract_background:
             image = flatten_background(image, src_detection_thresh = config.galaxy_detection_threshold,
                                        src_min_pixels = source_min_pix, show_plots=False)
-            # times["flatten_background"] = time.perf_counter()
+
         if reduce_noise_level:
             image = suppress_background(image, method ="logit", kernel = None, logit_alpha = 1.0)
             # smooth_noise_curve must be False, otherwise sep deblending may not work correctly
 
-        # times["psf_convolution"] = time.perf_counter()
 
         # First detection of sources
         if verbose:
@@ -127,7 +445,6 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
         if verbose:
             print("Detected", len(source_cat), "sources before cleaning.")
 
-        # times["first_detection"] = time.perf_counter()
 
         # Detecting and masking stars in the image
         if mask_stars:
@@ -135,7 +452,10 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             if verbose:
                 print("Detecting and masking stars...")
             main_source_mask = main_source_segment.make_source_mask()
-            image, masked_stars_mask, all_star_apertures = detect_and_mask_stars(image, main_source_mask, source_pos, phot_sources, config, image_psf, pix_scale, show_plots = show_plots)
+            image, masked_stars_mask, all_star_apertures = detect_and_mask_stars(image, main_source_mask, config,
+                                                                                 source_pos, phot_sources, image_psf,
+                                                                                 pix_scale, show_plots = show_plots)
+
             cleaning_mask = masked_stars_mask | cleaning_mask
             big_contaminator_flag = star_contamination_check(main_source_mask, all_star_apertures, config.big_contaminator_pix_ratio)
 
@@ -168,11 +488,10 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
             if verbose:
                 print("Removing secondary objects...")
             image, secondary_objects_mask = mask_secondary_detections(image, seg_map=seg_map, source_pos=source_pos,
-                                                                      pix_scale=1, verbose=verbose)
+                                                                      pix_scale=pix_scale, verbose=verbose)
             cleaning_mask = secondary_objects_mask | cleaning_mask
             # update_detections() not necessary from here on.
 
-        # times["deblending"] = time.perf_counter()
 
         # Smoothing the main source segmentation map
         if smooth_segmap:
@@ -208,9 +527,9 @@ def clean_image(image, image_psf = None, config = None, source_pos = None, redsh
 
         return image, main_source_segment, cleaning_mask, cleaning_flags
 
-    except Exception as e:
+    except Exception:
         print(traceback.format_exc())
-        raise e
+        raise
 
 if __name__ == "__main__":
 

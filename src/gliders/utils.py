@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 from collections import Counter
-from scipy.ndimage import label, generate_binary_structure, binary_dilation, binary_erosion
+from scipy.ndimage import label, generate_binary_structure, binary_dilation, binary_erosion, map_coordinates
 from scipy.ndimage import convolve as sci_convolve
 from skimage.draw import polygon
 from astropy.convolution import convolve, Gaussian2DKernel
@@ -892,7 +892,7 @@ def replace_mask_with_noise(input_image, mask, sigma_factor=3, base_line_factor 
 
     return image
 
-def get_image_centroid(image):
+def get_image_centroid(image, make_integers = True):
     """
     Calculate the centroid of a 2D image based on pixel intensities.
     """
@@ -904,8 +904,11 @@ def get_image_centroid(image):
     y_mean_sum = np.sum(y_mean)
     if x_mean_sum <= 0 or y_mean_sum <= 0:
         return None
-    x_centroid = int(np.sum(x_mean * x_coords) / x_mean_sum)
-    y_centroid = int(np.sum(y_mean * y_coords) / y_mean_sum)
+    x_centroid = np.sum(x_mean * x_coords) / x_mean_sum
+    y_centroid = np.sum(y_mean * y_coords) / y_mean_sum
+    if make_integers:
+        x_centroid = int(round(x_centroid))
+        y_centroid = int(round(y_centroid))
     return (x_centroid, y_centroid)
 
 def linear_kernel(type=8, center_weight=2.0):
@@ -926,6 +929,48 @@ def linear_kernel(type=8, center_weight=2.0):
 
     kernel[kernel.shape[0] // 2, kernel.shape[1] // 2] = center_weight
     return kernel
+
+def extract_profile(image, x0, y0, length, angle_deg):
+    """
+    Extract a 1D intensity profile along a line through a centroid.
+
+    Parameters
+    ----------
+    image : 2D numpy array
+        Input image.
+    x0, y0 : float
+        Centroid coordinates (x = column, y = row).
+    length : float
+        Total profile length in pixels.
+    angle_deg : float
+        Angle in degrees, counterclockwise from +x.
+
+    Returns
+    -------
+    distance : 1D array
+        Distance from the centroid in pixels.
+    profile : 1D array
+        Intensity sampled along the line.
+    """
+    # Sample every pixel (including subpixel coordinates)
+    distance = np.arange(-length / 2, length / 2 + 0.5, 1.0)
+
+    theta = np.deg2rad(angle_deg)
+
+    # Convert distances along the line to image coordinates
+    x = x0 + distance * np.cos(theta)
+    y = y0 - distance * np.sin(theta)
+
+    # Sample image: array coordinates are (row=y, column=x)
+    profile = map_coordinates(
+        image,
+        [y, x],
+        order=1,             # bilinear interpolation
+        mode="constant",
+        cval=np.nan
+    )
+
+    return distance, profile
 
 def grow_pixel_circular(mask_shape, position=None, radius=1):
     """

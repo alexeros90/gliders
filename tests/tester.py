@@ -1,10 +1,11 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from IPython.core.pylabtools import figsize
 from astropy.io import fits
 import gliders as gl
 from astropy.wcs import WCS
+
+import os
 
 def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
     all_bands = {}
@@ -52,30 +53,17 @@ def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
 
     return all_bands, all_weights, ref_hdu
 
-file_dir = "C:\\Astrostuff\\PhD\\Data\\DESI FITS"
-#file_dir = "C:\\Astrostuff\\PhD\\Data\\DESI FITS\\DESI_dwarf_AGN_fits"
-#file_dir = "C:\\DESI_fits_images\\DESI_dwarf_AGN_fits"
-# object_id = "39627841612027510"
-# id_n_z = (,)
-object_info = (39633244085289292,173.47971,49.84688, 0.0821)
-object_info = (39628516576202568,144.50186,31.63659,0.02251)
-object_info = (39627847656019106,150.98807,2.41803,0.02661)
-# object_info = (39633293687129181,212.82599,52.89456,0.07559)
-# object_info = (39627884997902878,218.32299,3.9033,0.02958)
-# object_info = (39627842752876903,218.68445,2.20796,0.06553)
+file_dir = ""
+object_info = (39627847656019106,150.98807,2.41803,0.02661) # ID, RA, DEC, redshift
+# object_info = (39633244085289292,173.47971,49.84688, 0.0821)
+# object_info = (39628516576202568,144.50186,31.63659,0.02251)
 
-# object_id = "39627841586861186"
-# object_id = "39627842752876903"
 object_id = object_info[0]
 obj_coords = (object_info[1],object_info[2])
 redshift = object_info[3]
-
-
-
 bands = ['r']
 file_name = f"{object_id}_{bands[0]}.fits"
 sources_name = f"{object_id}_sources.fits"
-
 
 file_path = os.path.join(file_dir, file_name)
 sources_path = os.path.join(file_dir, sources_name)
@@ -95,13 +83,14 @@ source_pos = (np.round(source_x_pix), np.round(source_y_pix))
 as_table['x_centroid'] = tractor_x_pix
 as_table['y_centroid'] = tractor_y_pix
 phot_sources = as_table['type','x_centroid','y_centroid']
-pix_scale = 1.72
+# pix_scale = 1.72 # For BASS images
 pix_scale = 1
 raw_image = all_bands['r']
 
 results = gl.clean_image(raw_image, redshift=redshift, wcs=wcs, mask_stars = True, show_plots=False, deblend_sources = True,
                          mask_sec_objects = True, clean_artifacts = True, phot_sources = phot_sources, source_pos=source_pos,
-                         pix_scale = pix_scale, verbose = True, skip_flagged_artifacts = False)
+                         pix_scale = pix_scale, verbose = True, skip_flagged_artifacts = False, deblend_delta_z = 0.01,
+                         deblend_with_redshift = False, deblend_with_photo_type = True, sync_z_query = False, smooth_segmap = False)
 
 clean_image, seg_map, removal_mask, cleaning_flags = results
 

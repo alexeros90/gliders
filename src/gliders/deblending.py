@@ -544,25 +544,25 @@ def remove_deblended_objects(image, seg_map, main_label, overlap_portion_thresho
         in_contact_with_main = _are_regions_in_contact(seg_map.data, main_label, this_source_label)
 
         if not in_contact_with_main:
-            image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, scale=pix_scale)
+            image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, pix_scale=pix_scale)
             continue
         secondary_is_contained = _check_if_region_is_contained(seg_map.data, this_source_label, main_label)
         if secondary_is_contained:
             image = interpolate_image(image, this_source_mask, method = "inpaint")
             image = add_noise_to_region(image, this_source_mask, noise_center = 0, noise_std = background_std,
-                                        scale=pix_scale)
+                                        pix_scale=pix_scale)
         else:
             overlapping_portion = _estimate_overlapping_portion(seg_map.data, main_label, this_source_label)
             if overlapping_portion < overlap_portion_threshold:
                 image = replace_mask_with_noise(image, this_source_mask_adjusted, n_pixels=mask_radius, sigma_factor=5,
-                                                scale = pix_scale, edge_smoothing_factor = 0)
+                                                pix_scale = pix_scale, edge_smoothing_factor = 0)
                 smoothing_layers = round(np.sqrt(np.sum(main_source_mask)) / (2*np.pi))
                 image = smooth_region_edge(image, main_source_mask, this_source_mask_adjusted, smoothing_layers,
                                            background_lvl, background_std, pix_scale = pix_scale)
 
             else:
                 influence_radius = mask_radius * overlapping_portion
-                image = replace_mask_with_noise(image, this_source_mask_adjusted, sigma_factor=5, scale = pix_scale,
+                image = replace_mask_with_noise(image, this_source_mask_adjusted, sigma_factor=5, pix_scale = pix_scale,
                                                 edge_smoothing_factor = 0.5)
                 layer_noise_sample = np.random.normal(loc=background_lvl, scale=background_std,
                                                       size=np.sum(this_source_mask_adjusted))

@@ -185,7 +185,7 @@ def mask_secondary_detections(image, seg_map=None, source_pos=None, pix_scale=1,
     secondaries_mask = secondaries_mask & ~main_mask
 
     image = replace_mask_with_noise(image, secondaries_mask, sigma_factor=3, use_median=False,
-                                        scale=pix_scale, smoothing_factor=0)
+                                        pix_scale=pix_scale, smoothing_factor=0)
     return image, secondaries_mask
 
 def flatten_background(image, box_size=(16, 16), filter_size=(5, 5), src_detection_thresh=5, src_min_pixels=5,

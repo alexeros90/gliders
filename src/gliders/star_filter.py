@@ -2,7 +2,7 @@ import numpy as np
 from photutils.profiles import RadialProfile
 from scipy.stats import pearsonr
 from astropy.modeling import models, fitting
-from .utils import get_image_centroid, sigma_clipping, grow_pixel_circular, get_profile_gradient
+from .utils import get_image_centroid, sigma_clipping, grow_pixel_circular, get_profile_gradient, extract_profile
 
 
 def _get_profile_average(profile):
@@ -55,50 +55,6 @@ def _get_symmetry_ratio(profile_1, profile_2, deviation):
     similarity_tolerance = np.pow((max_value - min_value), 2)
     return np.sqrt(deviation / similarity_tolerance)
 
-def _extract_centered_profile(image, mask, center, direction, radius, fill_value=-999):
-    """
-    Extract a profile in the specified direction from the circular mask,
-    centered at `center`, preserving image order and inserting `fill_value`
-    where valid mask pixels would fall outside the image.
-    """
-    h, w = image.shape
-    y, x = center
-    deltas = {
-        'horizontal': (0, 1),
-        'vertical': (1, 0),
-        'diagonal_main': (1, 1),  # \
-        'diagonal_anti': (1, -1),  # /
-    }
-
-    dy, dx = deltas[direction]
-    profile = []
-    # Sample from -radius to +radius
-    for step in range(-radius, radius + 1):
-        ny = y + dy * step
-        nx = x + dx * step
-
-        if 0 <= ny < h and 0 <= nx < w:
-            if mask[ny, nx]:
-                profile.append(image[ny, nx])
-        else:
-            # Pixel lies outside image, but would be part of circular mask
-            dist2 = (dy * step) ** 2 + (dx * step) ** 2
-            if dist2 <= radius ** 2:
-                profile.append(fill_value)
-
-    return np.array(profile)
-
-def _extract_all_profiles(image, mask, center, radius, fill_value=-999):
-    """
-    Extract profiles in all four directions from the circular mask centered at `center`.
-    """
-    return {
-        'horizontal': _extract_centered_profile(image, mask, center, 'horizontal', radius, fill_value),
-        'vertical': _extract_centered_profile(image, mask, center, 'vertical', radius, fill_value),
-        'diagonal_main': _extract_centered_profile(image, mask, center, 'diagonal_main', radius, fill_value),
-        'diagonal_anti': _extract_centered_profile(image, mask, center, 'diagonal_anti', radius, fill_value),
-    }
-
 def _patch_profile(profile, null_value=-999):
     """
     Patch a profile by replacing null values with the corresponding values from the opposite end of the profile.
@@ -150,72 +106,160 @@ def _compare_profiles(profile_1, profile_2):
 
     return pearson_corr, p_value_corr, euclidean_dist, cos_dist
 
-def _get_mean_profile_symmetry_ratio_sum(profiles, fill_value):
-    """
-    Calculate the sum of mean symmetry ratios for orthogonal and diagonal profile pairs.
-    """
-    orth_ratio = _get_mean_profile_symmetry_ratio(profiles['horizontal'], profiles['vertical'], fill_value)
-    diag_ratio = _get_mean_profile_symmetry_ratio(profiles['diagonal_main'], profiles['diagonal_anti'], fill_value)
-    if orth_ratio is None:
-        orth_ratio = 100
-    if diag_ratio is None:
-        diag_ratio = 100
-    return orth_ratio + diag_ratio
-
 def _star_processing_parallel_wrapper(i, star, image, params):
     """
     Wrapper function for parallel processing of stars.
     """
-    final_radius, final_std = process_one_star(star,image,params)
+    final_radius, final_std = _process_one_star(star,image,params)
 
     return i, final_radius, final_std
 
-def process_one_star(this_star, image, params):
+def _process_one_star(this_star, image, params):
     """
-    Process a single star to determine its radius and profile standard deviation.
+    Determine the valid radius of a star using its radial intensity profile
+    and validate the star against profile, symmetry, and Gaussian-shape
+    criteria.
+
+    The function iteratively computes the star's radial profile over
+    increasing radii, starting at ``min_radius`` and ending at ``max_radius``
+    or earlier if a stopping criterion is met. It tracks the last radius
+    for which the radial profile satisfies the selection criteria.
+
+    If the star is close to an image boundary, its effective centroid may
+    be relocated using a circular mask and an intensity-weighted centroid
+    estimate.
+
+    After the radius search, the candidate is validated using the following
+    tests, where applicable:
+
+    - Radial-profile similarity to a reference PSF profile.
+    - Validity of a fitted two-dimensional Gaussian.
+    - Symmetry of the profiles extracted along the Gaussian's principal axes.
+    - Ratio of the Gaussian's fitted standard deviations.
+
+    A star that fails any required post-processing test is rejected.
 
     Parameters
     ----------
     this_star : dict
-        A dictionary containing information about the star, including its centroid coordinates.
-    image : 2D array
-        The image in which the star is located.
+        Dictionary describing the candidate star. Must contain the following
+        keys:
+
+        - ``'y_centroid'`` : float
+            Estimated centroid row coordinate in the image.
+        - ``'x_centroid'`` : float
+            Estimated centroid column coordinate in the image.
+        - ``'type'`` : str
+            Star classification. If the value is not ``"PSF"`` and a
+            reference PSF profile is provided, profile similarity is tested.
+
+    image : numpy.ndarray
+        Two-dimensional image array containing the candidate star. Pixel
+        values are used to compute the radial profile, estimate a relocated
+        centroid when necessary, and fit a two-dimensional Gaussian.
+
     params : tuple
-        A tuple containing various parameters for processing, including:
-        - min_radius : int
-        - max_radius : int
-        - rp_psf : RadialProfile or None
-        - rp_error : 2D array
-        - image_background : float
-        - gaussian_fitter : astropy.modeling.fitting.Fitter
-        - std_convergence_threshold : float
-            The relative difference threshold for the convergence of the fitted gaussian profile std. Determines if the
-            star radius is compared to the fitted gaussian std (see gaussian_fit_max_sigma).
-        - gaussian_fit_max_sigma : float
-            The star radius cannot be larger than the fitted gaussian profile std * gaussian_fit_max_sigma. This is
-            only checked if the relative difference between the profiles of two consecutive radii is lower than
-            std_convergence_threshold
-        - slope_threshold : float
-        - delta_slope_threshold : float
-        - profile_cos_distance_threshold : float
-        - mean_symmetry_ratio_threshold : float
-        - gaussian_ratio_threshold : float
-        - fill_value : float
+        Tuple containing the parameters required for radius selection and
+        star validation, in the following order:
+
+        min_radius : int
+            Minimum radius, in pixels, considered during the search.
+        max_radius : int
+            Maximum radius, in pixels, considered during the search.
+        rp_psf : object or None
+            Reference radial PSF profile. Its ``profile`` attribute is used
+            for comparison with the candidate's radial profile. The
+            comparison is skipped for stars classified as ``"PSF"`` or
+            when this value is ``None``.
+        image_background : float
+            Background intensity threshold. The search stops if any radial
+            profile value is less than or equal to this value.
+        gaussian_fitter : callable
+            Callable used to fit the initialized two-dimensional Gaussian
+            model to the image cutout. It must return a fitted model with
+            ``x_stddev``, ``y_stddev``, and ``theta`` parameters.
+        std_convergence_threshold : float
+            Relative change threshold used to determine whether the fitted
+            radial-profile standard deviation has converged.
+        gaussian_fit_max_sigma : float
+            Maximum permitted ratio of the current search radius to the
+            previous fitted radial-profile standard deviation once
+            convergence has been detected.
+        slope_threshold : float
+            Minimum slope threshold used by the radial-profile stopping
+            criterion.
+        delta_slope_threshold : float
+            Maximum slope-change threshold used by the radial-profile
+            stopping criterion.
+        profile_cos_distance_threshold : float
+            Maximum permitted cosine distance between the reference PSF
+            profile and the candidate's radial profile. The candidate is
+            rejected when the distance exceeds this threshold.
+        symmetry_ratio_threshold : float
+            Maximum permitted mean symmetry ratio between profiles extracted
+            along the fitted Gaussian's principal axes.
+        gaussian_ratio_threshold : float
+            Maximum permitted ratio between the fitted Gaussian standard
+            deviations. The ratio is defined as the larger standard
+            deviation divided by the smaller one.
 
     Returns
     -------
-    final_radius : int
-        The determined radius of the star. Returns 0 if the star does not pass the filtering criteria.
-    final_std : float
-        The standard deviation of the star's profile. Returns 0 if the star does not pass the filtering criteria.
+    tuple of (int, float)
+        A tuple ``(final_radius, final_std)`` containing:
+
+        final_radius : int
+            Selected radius, in pixels. Returns ``0`` if no valid radius
+            is found or if the candidate fails a post-processing test.
+        final_std : float
+            Fitted standard deviation of the radial profile associated
+            with the selected radius. Returns ``0`` when the candidate is
+            rejected or no valid radius is found.
+
+    Notes
+    -----
+    The radius search terminates early if any of the following conditions
+    is encountered:
+
+    - The radius exceeds half the smaller image dimension.
+    - The candidate is sufficiently close to an image boundary and the
+      relocation procedure does not subsequently allow further processing
+      to continue normally.
+    - The radial profile has zero total absolute intensity.
+    - Any radial profile value is less than or equal to the background
+      threshold.
+    - The fitted radial-profile standard deviation converges and the
+      radius exceeds the configured multiple of that standard deviation.
+    - The radial-profile slope and slope-change criteria indicate that
+      the profile is stabilizing.
+
+    The effective centroid may differ from the original centroid when
+    relocation is performed near an image boundary.
+
+    The Gaussian is fitted to a square image cutout centered approximately
+    on the effective centroid and extending to the selected radius, clipped
+    to the image boundaries.
+
+    A successful return indicates that the candidate passed the implemented
+    validation criteria; it does not guarantee that the candidate is
+    astrophysically a star.
+
+    Notes
+    -----
+    This function depends on the following external helpers and objects:
+    ``_get_distance_to_closest_edge``, ``grow_pixel_circular``,
+    ``get_image_centroid``, ``RadialProfile``, ``get_profile_gradient``,
+    ``_compare_profiles``, ``extract_profile``,
+    and ``_get_mean_profile_symmetry_ratio``, as well as the Gaussian
+    model implementation provided by ``models.Gaussian2D``.
+
     """
 
     (
-        min_radius, max_radius, rp_psf, rp_error,
-        image_background, gaussian_fitter, std_convergence_threshold, gaussian_fit_max_sigma,
-        slope_threshold, delta_slope_threshold,
-        profile_cos_distance_threshold, mean_symmetry_ratio_threshold,
-        gaussian_ratio_threshold, fill_value
+        min_radius, max_radius, rp_psf, image_background, gaussian_fitter, std_convergence_threshold,
+        gaussian_fit_max_sigma, slope_threshold, delta_slope_threshold,
+        profile_cos_distance_threshold, symmetry_ratio_threshold,
+        gaussian_ratio_threshold
     ) = params
 
     y_cen, x_cen = this_star['y_centroid'], this_star['x_centroid']
@@ -240,8 +284,7 @@ def process_one_star(this_star, image, params):
             break
         if distance_to_closest_edge < radius / 2 and not relocated:
             mask = grow_pixel_circular(image.shape, candidate_pos, radius)
-            # new_cc = get_image_centroid(image * mask) # TODO: Check and test if this is better than the below method
-            new_cc = get_image_centroid(image * image * mask)
+            new_cc = get_image_centroid(image * mask)
             if new_cc is not None:
                 new_c_x, new_c_y = new_cc
                 candidate_eff_pos = (new_c_y, new_c_x)
@@ -249,11 +292,11 @@ def process_one_star(this_star, image, params):
 
         edge_radii = np.arange(radius + 1)
         rp = RadialProfile(image, (candidate_eff_pos[1], candidate_eff_pos[0]),
-                           edge_radii, error=rp_error, mask=None, method="center")
+                           edge_radii, error=None, mask=None, method="center")
 
         if np.sum(np.abs(rp.profile)) == 0:
             break
-        if np.any(rp.data_profile <= image_background):
+        if np.any(rp.profile <= image_background):
             break
 
         new_profile_std = rp.gaussian_fit.stddev.value
@@ -267,9 +310,7 @@ def process_one_star(this_star, image, params):
                     break
         profile_std = new_profile_std
 
-        print("rp.data_profile")
-        print(rp.data_profile)
-        if len(rp.data_profile) < 2:
+        if len(rp.profile) < 2:
             continue
 
         profile_slopes, profile_delta_slopes = get_profile_gradient(rp.profile)
@@ -281,11 +322,13 @@ def process_one_star(this_star, image, params):
             delta_last = profile_delta_slopes[-1]
             delta_prev = profile_delta_slopes[-2]
 
-            if slope_last > slope_prev and np.max(profile_slopes) > slope_threshold: # TODO: Check why this.
+            # Cond 1: The slope is increasing and above the threshold.
+            if slope_last > slope_prev and np.max(profile_slopes) > slope_threshold:
+                # Cond 2: The slope change is decreasing (slopes are stabilizing) and below the threshold
                 if delta_last < delta_prev and delta_last < delta_slope_threshold:
                     break
 
-        if max_delta_slope > 0: # TODO: Check why this.
+        if max_delta_slope > 0: # If the slope started to increase at any point we consider the radius as valid.
             final_radius = radius
             final_profile = rp.profile
             final_std = profile_std
@@ -325,19 +368,21 @@ def process_one_star(this_star, image, params):
         fit = gaussian_fitter(init, cutout_x, cutout_y, cutout)
         x_std = fit.x_stddev.value
         y_std = fit.y_stddev.value
+        theta = fit.theta.value
+        theta_deg = 180 * theta / np.pi
 
         if (not np.isfinite(x_std) or not np.isfinite(y_std) or x_std <= 0 or y_std <= 0):
             return 0, 0
         gaussian_ratio = max(x_std / y_std, y_std / x_std)
 
-        mask = grow_pixel_circular(image.shape, candidate_eff_pos, final_radius)
-        profiles = _extract_all_profiles(image, mask, candidate_eff_pos, final_radius, fill_value)
-        for key in profiles:
-            profiles[key] = _patch_profile(profiles[key], fill_value)
+        # Getting the profiles over the gaussian ellipse axes
+        distance_a, profile_a = extract_profile(cutout, cutout_nx / 2, cutout_ny / 2, 2 * final_radius - 1, theta_deg)
+        distance_b, profile_b = extract_profile(cutout, cutout_nx / 2, cutout_ny / 2, 2 * final_radius - 1,
+                                                theta_deg + 90)
+        
+        symmetry_ratio = _get_mean_profile_symmetry_ratio(profile_a, profile_b, np.nan)
 
-        mean_symmetry_ratio = _get_mean_profile_symmetry_ratio_sum(profiles, fill_value)
-        if (mean_symmetry_ratio > mean_symmetry_ratio_threshold or
-                gaussian_ratio > gaussian_ratio_threshold):
+        if (symmetry_ratio > symmetry_ratio_threshold) or (gaussian_ratio > gaussian_ratio_threshold):
             return 0, 0
 
         # Success — update and return the result
@@ -345,43 +390,160 @@ def process_one_star(this_star, image, params):
 
 def star_detection_filtering(image, stars_detected, min_radius=2, max_radius=15, slope_threshold = -0.008,
                              delta_slope_threshold = 0.008, image_psf = None, profile_cos_distance_threshold = 0.045,
-                             mean_symmetry_ratio_threshold = 0.07, gaussian_ratio_threshold = 1.2, std_convergence_threshold = 0.01,
+                             symmetry_ratio_threshold = 0.07, gaussian_ratio_threshold = 1.2, std_convergence_threshold = 0.01,
                              gaussian_fit_max_sigma = 3, do_parallel = False, show_plots = False):
     """
-        Filtering of detected stars based on radial profile analysis and measuring of their radius.
-        Returns a table of stars that passed the filtering with their measured radius and profile stddev.
+    Filter detected stars using radial-profile and shape-based criteria.
 
-        Parameters
-        ----------
-        image : 2D array
-            The image that will be analyzed.
-        stars_detected: table
-            The table of detected stars
-        min_radius: int
-            Minimum radius in pixels for a star to be accepted
-        max_radius: int
-            Maximum radius in pixels for a star to be accepted
-        slope_threshold: float
-            Threshold for the slope of the profile. When this threshold and delta_slope_threshold are met, we define the star's radius
-        delta_slope_threshold: float
-            Threshold for the change in slope of the profile. When this threshold and delta_slope_threshold are met, we define the star's radius
-        image_psf: 2D array
-            The image of the PSF to compare the profiles with
-        profile_cos_distance_threshold: float
-            The maximum cosine distance allowed between the star profile and the PSF profile
-        mean_symmetry_ratio_threshold: float
-            The maximum mean symmetry ratio allowed for the star profiles
-        gaussian_ratio_threshold: float
-            The maximum accepted ratio between the x and y sigma of the 2D gaussian fit to the star cutout
-        std_convergence_threshold: float
-            The threshold for the convergence of the stddev of the fitted gaussian. When the stddev converges, we define the star's radius
-        gaussian_fit_max_sigma: float
-            The maximum number of sigmas of the fitted gaussian at which we accept the radius.
-        do_parallel: bool
-            Process stars with parallel computing
-        show_plots
-            Show the image with the apertures overlaid
-        """
+    Each candidate star is processed to estimate a valid radius from its
+    radial intensity profile. Candidates are then validated using criteria
+    based on radial-profile behavior, optional similarity to a reference
+    point spread function (PSF), and the symmetry and shape of a fitted
+    two-dimensional Gaussian.
+
+    The estimated radius and radial-profile standard deviation are stored
+    in the input ``stars_detected`` array in the ``'r'`` and ``'std'``
+    fields, respectively. Candidates with a positive estimated radius are
+    retained in the returned array.
+
+    Star processing can be performed sequentially or in parallel using a
+    thread pool. An optional plot can be displayed to visualize the image
+    and the estimated radius of each detected candidate.
+
+    Parameters
+    ----------
+    image : numpy.ndarray
+        Two-dimensional image containing the detected stars. Used to
+        estimate the background level, calculate radial profiles, and
+        validate the candidates.
+
+    stars_detected : numpy.ndarray or None
+        Structured NumPy array containing the detected star candidates.
+        Each entry must include at least the following fields:
+
+        - ``'x_centroid'`` : float
+            Estimated centroid column coordinate.
+        - ``'y_centroid'`` : float
+            Estimated centroid row coordinate.
+        - ``'id'`` : object
+            Candidate identifier, required when ``show_plots=True``.
+
+        The array is modified in place by adding or updating the ``'r'``
+        and ``'std'`` fields. These fields must be supported by the array's
+        dtype.
+
+    min_radius : int, optional
+        Minimum radius, in pixels, considered when determining the valid
+        radius of a candidate. Must be at least 1. Default is 2.
+
+    max_radius : int, optional
+        Maximum radius, in pixels, considered during the radius search.
+        Must be greater than or equal to ``min_radius``. Default is 15.
+
+    slope_threshold : float, optional
+        Slope threshold used by the radial-profile stopping criterion.
+        Default is -0.008.
+
+    delta_slope_threshold : float, optional
+        Slope-change threshold used to identify stabilization of the radial
+        intensity profile. Default is 0.008.
+
+    image_psf : numpy.ndarray or None, optional
+        Reference image representing the point spread function (PSF).
+        If provided, a radial profile is computed from the image center and
+        used to evaluate the similarity of eligible candidates to the
+        reference profile. Candidates classified as ``"PSF"`` are not
+        subjected to this comparison by ``_process_one_star``.
+        If ``None``, PSF profile comparison is skipped. Default is ``None``.
+
+    profile_cos_distance_threshold : float, optional
+        Maximum permitted cosine distance between a candidate's radial
+        profile and the reference PSF profile. Candidates exceeding this
+        threshold are rejected. Default is 0.045.
+
+    symmetry_ratio_threshold : float, optional
+        Maximum permitted mean symmetry ratio between profiles extracted
+        along the principal axes of the fitted Gaussian. Candidates
+        exceeding this threshold are rejected. Default is 0.07.
+
+    gaussian_ratio_threshold : float, optional
+        Maximum permitted ratio between the fitted Gaussian's standard
+        deviations along its two principal axes. The ratio is calculated
+        as the larger standard deviation divided by the smaller one.
+        Candidates exceeding this threshold are rejected. Default is 1.2.
+
+    std_convergence_threshold : float, optional
+        Relative change threshold used to determine convergence of the
+        fitted radial-profile standard deviation during the radius search.
+        Default is 0.01.
+
+    gaussian_fit_max_sigma : float, optional
+        Maximum permitted ratio of the current search radius to the
+        previous fitted radial-profile standard deviation once convergence
+        has been detected. Default is 3.
+
+    do_parallel : bool, optional
+        If ``True``, process candidates concurrently using a
+        ``ThreadPoolExecutor`` with up to 30 worker threads. If ``False``,
+        process candidates sequentially. Default is ``False``.
+
+    show_plots : bool, optional
+        If ``True``, display the image using a logarithmic intensity
+        normalization and overlay a circle for each detected candidate,
+        centered on its original centroid and with radius equal to its
+        estimated radius. Candidate identifiers are also displayed.
+        Rejected candidates are shown with a zero-radius circle.
+        Default is ``False``.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        A filtered view of ``stars_detected`` containing only candidates
+        whose estimated radius is greater than zero. The returned array
+        retains the original structured dtype and all existing fields,
+        including the newly assigned ``'r'`` and ``'std'`` fields.
+
+        Returns ``None`` if ``stars_detected`` is empty or evaluates to
+        ``False``.
+
+    Raises
+    ------
+    ValueError
+        If ``min_radius`` is less than 1, or if ``max_radius`` is less
+        than ``min_radius``.
+
+    Notes
+    -----
+    The image background level and its standard deviation are estimated
+    using ``sigma_clipping``. The background level is used during candidate
+    processing; the estimated background standard deviation is calculated
+    but is not otherwise used in this function.
+
+    When ``image_psf`` is provided, its radial profile is calculated using
+    the image center and radii from zero up to, but excluding, half the
+    image width, rounded down. The resulting profile is used as the
+    reference for candidate validation.
+
+    Candidate processing is delegated to ``_process_one_star`` in
+    sequential mode and to ``_star_processing_parallel_wrapper`` in
+    parallel mode.
+
+    The input array is modified in place, even though the returned array
+    contains only accepted candidates. Consequently, rejected candidates
+    remain in ``stars_detected`` with their computed ``'r'`` and ``'std'``
+    values, typically both zero.
+
+    The returned filtered array is a view rather than an independent copy.
+    Modifications to its elements may therefore affect the corresponding
+    elements in ``stars_detected``.
+
+    Notes
+    -----
+    This function depends on ``sigma_clipping``, ``RadialProfile``,
+    ``_process_one_star``, and, when parallel processing is enabled,
+    ``_star_processing_parallel_wrapper``. Plotting requires Matplotlib.
+
+    """
 
     if not stars_detected:
         return None
@@ -390,28 +552,23 @@ def star_detection_filtering(image, stars_detected, min_radius=2, max_radius=15,
     if max_radius < min_radius:
         raise ValueError("Maximum radius cannot be less than minimum radius.")
 
-    fill_value = -999
     image_background, image_background_std = sigma_clipping(image)
-    rp_error = np.full_like(image, image_background_std)
-    # rp_error = np.full_like(image, image_background) #TODO: Check if this is better than the above line
     stars_detected['r'] = 0
     stars_detected['std'] = 0.0
     if image_psf is not None:
-        psf_background, psf_background_std = sigma_clipping(image_psf)
-        rp_psf_error = np.zeros_like(image_psf) + psf_background
         rp_psf = RadialProfile(image_psf, (image_psf.shape[1]//2, image_psf.shape[0]//2),
-                               np.arange(image_psf.shape[1]//2), error=rp_psf_error, mask=None, method = "center")
+                               np.arange(image_psf.shape[1]//2), error=None, mask=None, method = "center")
     else:
         rp_psf = None
     gaussian_fitter = fitting.TRFLSQFitter()
 
     params = (
-        min_radius, max_radius, rp_psf, rp_error,
+        min_radius, max_radius, rp_psf,
         image_background, gaussian_fitter,
         std_convergence_threshold, gaussian_fit_max_sigma,
         slope_threshold, delta_slope_threshold,
-        profile_cos_distance_threshold, mean_symmetry_ratio_threshold,
-        gaussian_ratio_threshold, fill_value
+        profile_cos_distance_threshold, symmetry_ratio_threshold,
+        gaussian_ratio_threshold
     )
 
     if do_parallel:
@@ -427,7 +584,7 @@ def star_detection_filtering(image, stars_detected, min_radius=2, max_radius=15,
                 stars_detected[i]['std'] = final_std
     else:
         for this_star in stars_detected:
-            final_radius, final_std = process_one_star(this_star, image, params)
+            final_radius, final_std = _process_one_star(this_star, image, params)
             this_star['r'] = final_radius
             this_star['std'] = final_std
 

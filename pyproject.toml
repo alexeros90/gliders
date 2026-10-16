@@ -5,6 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gliders"
 version = "0.1.0"
+authors = [
+  { name="Alejandro Erostegui", email="alexeros90@gmail.com" },
+]
 description = "GaLaxy Image DEcontamination Scripts - GLIDErS: Galaxy image cleaning and deblending pipeline"
 requires-python = ">=3.9"
 
