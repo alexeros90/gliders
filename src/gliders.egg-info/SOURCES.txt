@@ -1,3 +1,5 @@
+LICENSE
+README.md
 pyproject.toml
 src/gliders/__init__.py
 src/gliders/artifacts.py
@@ -9,7 +11,6 @@ src/gliders/pipeline.py
 src/gliders/star_filter.py
 src/gliders/stars.py
 src/gliders/utils.py
-src/gliders/vault.py
 src/gliders.egg-info/PKG-INFO
 src/gliders.egg-info/SOURCES.txt
 src/gliders.egg-info/dependency_links.txt
