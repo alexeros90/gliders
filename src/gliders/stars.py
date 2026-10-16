@@ -399,7 +399,7 @@ def interpolate_apertures(image, main_source_mask, apertures, interpolation_exte
         sub_img_mask_grown = grow_mask(sub_img_mask.data, to_grow*aperture_factor)
         interpolated_img = interpolate_image(sub_img.data, sub_img_mask_grown,
                                              np.max((to_grow,1.)), method = "inpaint")
-        interpolated_img = add_noise_to_region(interpolated_img, sub_img_mask_grown, noise_center= 0, noise_std=image_background_std, scale=pix_scale)
+        interpolated_img = add_noise_to_region(interpolated_img, sub_img_mask_grown, noise_center= 0, noise_std=image_background_std, pix_scale=pix_scale)
         image_cp[sub_img.ymin_original:sub_img.ymax_original + 1, sub_img.xmin_original:sub_img.xmax_original + 1] = interpolated_img
 
     return image_cp

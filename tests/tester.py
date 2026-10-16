@@ -58,14 +58,15 @@ def extract_band_data(hdu_list, verbose=True, bands_to_analyze = ['r']):
 file_dir = "C:\Astrostuff\PhD\Data\DESI FITS\DESI_dwarf_AGN_fits"
 
 # object_info = (39627847656019106,150.98807,2.41803,0.02661) # ID, RA, DEC, redshift
-object_info = (39633244085289292,173.47971,49.84688, 0.0821)
-# object_info = (39628516576202568,144.50186,31.63659,0.02251)
+# object_info = (39633244085289292,173.47971,49.84688, 0.0821)
+object_info = (39627773882401920,73.5449,-0.39993,0.05467)
 
 object_id = object_info[0]
 obj_coords = (object_info[1],object_info[2])
 redshift = object_info[3]
 bands = ['r']
-file_name = f"{object_id}_{bands[0]}.fits"
+# file_name = f"{object_id}_{bands[0]}.fits"
+file_name = f"{object_id}_rg.fits"
 sources_name = f"{object_id}_sources.fits"
 
 file_path = os.path.join(file_dir, file_name)
