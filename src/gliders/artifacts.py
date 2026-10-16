@@ -1,5 +1,5 @@
 import numpy as np
-from .utils import interpolate_image, grow_mask, add_noise_to_region, sigma_clipping, shrink_mask, get_profile_gradient, get_profile_from_border
+from .utils import interpolate_image, grow_mask, add_noise_to_region, sigma_clipping, get_profile_gradient, get_profile_from_border
 from photutils.segmentation import SourceCatalog, detect_sources
 
 
@@ -176,7 +176,7 @@ def clean_artifacts(image, artifact_segmap = None, bleeding_factor = 1.0, interp
 
     image = interpolate_image(image, full_cleaning_mask, interpolation_radius, method="inpaint")
     _, img_bkg_lvl_std = sigma_clipping(image)
-    image = add_noise_to_region(image, full_cleaning_mask, noise_center=0, noise_std=img_bkg_lvl_std, scale=pix_scale)
+    image = add_noise_to_region(image, full_cleaning_mask, noise_center=0, noise_std=img_bkg_lvl_std, pix_scale=pix_scale)
     return image, full_cleaning_mask
 
 def detect_artifacts(image, npixels_artifact=100, delta_slope_threshold = 2.7, segment_slack = 5, hi_pass_threshold = 1):

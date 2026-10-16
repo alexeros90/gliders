@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: gliders
-Version: 0.1.3
+Version: 0.1.4
 Summary: GaLaxy Image DEcontamination Scripts - GLIDErS: Galaxy image cleaning and deblending pipeline
 Author-email: Alejandro Erostegui <alexeros90@gmail.com>
 License: Copyright (c) 2026 Alejandro Erostegui Losantos
