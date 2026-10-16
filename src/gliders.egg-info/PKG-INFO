@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: gliders
-Version: 0.1.1
+Version: 0.1.2
 Summary: GaLaxy Image DEcontamination Scripts - GLIDErS: Galaxy image cleaning and deblending pipeline
 Author-email: Alejandro Erostegui <alexeros90@gmail.com>
 License: Copyright (c) 2026 Alejandro Erostegui Losantos
@@ -22,6 +22,9 @@ License: Copyright (c) 2026 Alejandro Erostegui Losantos
         LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
         OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
         SOFTWARE.
+Project-URL: Homepage, https://github.com/alexeros90/gliders
+Project-URL: Repository, https://github.com/alexeros90/gliders
+Project-URL: Issues, https://github.com/alexeros90/gliders/issues
 Requires-Python: >=3.9
 Description-Content-Type: text/markdown
 License-File: LICENSE
@@ -77,4 +80,8 @@ GLIDErS uses a configuration object to control source detection, masking, and de
 
 ## License
 
-See the repository's `LICENSE` file for licensing information.
+See the [`LICENSE`](LICENSE) file for licensing information.
+
+- **GitHub:** [View the source code](https://github.com/YOUR_USERNAME/GLIDErS)
+- **PyPI:** [View the package on PyPI](https://pypi.org/project/GLIDErS/)
+- **Issues:** [Report a bug or request a feature](https://github.com/YOUR_USERNAME/GLIDErS/issues)
